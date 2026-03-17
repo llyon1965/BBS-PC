@@ -1,386 +1,539 @@
 /* BBSINIT.C
  *
- * First-pass BBS-PC 4.20 initialization / maintenance utility
+ * BBS-PC ! 4.21
  *
- * Updated to use:
- * - node_create_file()
- * - node_set_pseudo_counter_file()
+ * Reconstructed and modernised source
+ * derived from BBS-PC 4.20
  *
- * Corrected:
- * - writes "UD=%s" instead of "UD =%s" in BBS.P
+ * Initial configuration utility.
  *
- * Supports:
- * - interactive parameter-file generation
- * - interactive main datafile creation
- * - interactive node-file creation
- * - -m:x renumber message base
- * - -c:x set highest caller number
- * - -s:x set pseudo filename counter for a node
- * - -u   update U/D paths
+ * Ownership added here:
+ * - writes legacy configuration files
+ * - writes BBSPATHS.CFG at the same time
+ * - creates core fixed-record data files with safe headers
+ * - initialises node files
+ *
+ * Notes:
+ * - BBSPATHS.CFG is treated as the modern path-ownership file for the
+ *   reconstructed tree.
+ * - Legacy packed/on-disk formats are preserved where required.
+ * - This utility now owns generation of BBSPATHS.CFG rather than leaving
+ *   it as an implicit external dependency.
  */
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <ctype.h>
 
 #include "bbsdata.h"
 #include "bbsfunc.h"
 
-#define HDRLEN 128
+#ifndef BBS_VERSION
+#define BBS_VERSION "BBS-PC ! 4.21"
+#endif
 
-static long opt_msg_base = -1L;
-static long opt_call_no  = -1L;
-static long opt_pseudo   = -1L;
-static int  opt_update_ud = 0;
+#ifndef HDRLEN
+#define HDRLEN 128L
+#endif
+
+#ifndef MAX_PATHNAME
+#define MAX_PATHNAME 128
+#endif
 
 /* ------------------------------------------------------------ */
+/* local helpers                                                */
+/* ------------------------------------------------------------ */
 
-static void write_blank_header(fp)
-FILE *fp;
+static void init_zero_paths(paths)
+BBSPATHS *paths;
 {
-    unsigned char hdr[HDRLEN];
-
-    memset(hdr, 0, sizeof(hdr));
-    fwrite(hdr, sizeof(hdr), 1, fp);
+    memset(paths, 0, sizeof(*paths));
 }
 
-static int create_blank_dat(fname)
-char *fname;
+static void init_zero_cfg(cfg)
+CFGINFO *cfg;
 {
-    FILE *fp;
-
-    fp = fopen(fname, "wb");
-    if (!fp)
-        return 0;
-
-    write_blank_header(fp);
-    fclose(fp);
-    return 1;
+    memset(cfg, 0, sizeof(*cfg));
 }
 
-static int create_fixed_dat(fname, reclen, count)
-char *fname;
-int reclen;
-int count;
+static void trim_crlf(s)
+char *s;
 {
-    FILE *fp;
-    void *buf;
+    while (*s)
+    {
+        if (*s == '\r' || *s == '\n')
+        {
+            *s = 0;
+            return;
+        }
+        s++;
+    }
+}
+
+static void ensure_trailing_slash(path)
+char *path;
+{
+    int n;
+
+    if (!path || !path[0])
+        return;
+
+    n = strlen(path);
+    if (n <= 0)
+        return;
+
+    if (path[n - 1] != '\\' && path[n - 1] != '/')
+        strcat(path, "\\");
+}
+
+static void join_path(dst, dir, name)
+char *dst;
+char *dir;
+char *name;
+{
+    strcpy(dst, dir);
+    ensure_trailing_slash(dst);
+    strcat(dst, name);
+}
+
+static int prompt_yesno(prompt, def_yes)
+char *prompt;
+int def_yes;
+{
+    char line[16];
+
+    printf("%s", prompt);
+    if (!fgets(line, sizeof(line), stdin))
+        return def_yes;
+
+    trim_crlf(line);
+    if (!line[0])
+        return def_yes;
+
+    return (line[0] == 'Y' || line[0] == 'y');
+}
+
+static void prompt_line(prompt, out, outlen, defval)
+char *prompt;
+char *out;
+int outlen;
+char *defval;
+{
+    char line[256];
+
+    printf("%s", prompt);
+    if (defval && defval[0])
+        printf(" [%s]", defval);
+    printf(": ");
+
+    if (!fgets(line, sizeof(line), stdin))
+    {
+        if (defval)
+            strncpy(out, defval, outlen - 1);
+        else
+            out[0] = 0;
+        out[outlen - 1] = 0;
+        return;
+    }
+
+    trim_crlf(line);
+    if (!line[0] && defval)
+        strncpy(out, defval, outlen - 1);
+    else
+        strncpy(out, line, outlen - 1);
+
+    out[outlen - 1] = 0;
+}
+
+static void default_section_paths(paths, base)
+BBSPATHS *paths;
+char *base;
+{
     int i;
+    char tmp[MAX_PATHNAME];
 
-    fp = fopen(fname, "wb");
+    for (i = 0; i < NUM_SECT; i++)
+    {
+        sprintf(tmp, "%sUPDN%02d", base, i);
+        strncpy(paths->updn_path[i], tmp, sizeof(paths->updn_path[i]) - 1);
+        paths->updn_path[i][sizeof(paths->updn_path[i]) - 1] = 0;
+        ensure_trailing_slash(paths->updn_path[i]);
+    }
+}
+
+static void init_default_paths(paths)
+BBSPATHS *paths;
+{
+    init_zero_paths(paths);
+
+    strcpy(paths->msg_path,  "MSG");
+    strcpy(paths->usr_path,  "USER");
+    strcpy(paths->ud_path,   "UD");
+    strcpy(paths->log_path,  "LOG");
+
+    ensure_trailing_slash(paths->msg_path);
+    ensure_trailing_slash(paths->usr_path);
+    ensure_trailing_slash(paths->ud_path);
+    ensure_trailing_slash(paths->log_path);
+
+    default_section_paths(paths, "");
+}
+
+static void init_default_cfg(cfg)
+CFGINFO *cfg;
+{
+    init_zero_cfg(cfg);
+
+    /* Conservative defaults.
+     * Only fields known to exist in the reconstructed tree should be
+     * touched here.
+     */
+    strncpy(cfg->bbsname, "BBS-PC ! 4.21", sizeof(cfg->bbsname) - 1);
+    cfg->bbsname[sizeof(cfg->bbsname) - 1] = 0;
+
+    strncpy(cfg->sysopname, "SYSOP", sizeof(cfg->sysopname) - 1);
+    cfg->sysopname[sizeof(cfg->sysopname) - 1] = 0;
+
+    cfg->node = 0;
+    cfg->min_baud = 300;
+    cfg->max_baud = 2400;
+    cfg->page_len = 24;
+}
+
+static int make_dir_if_needed(path)
+char *path;
+{
+    char cmd[256];
+
+    if (!path || !path[0])
+        return 1;
+
+#if defined(__TURBOC__) || defined(__BORLANDC__) || defined(_MSC_VER)
+    sprintf(cmd, "IF NOT EXIST %s MD %s", path, path);
+    return system(cmd) == 0;
+#else
+    sprintf(cmd, "mkdir -p %s", path);
+    return system(cmd) == 0;
+#endif
+}
+
+static int ensure_runtime_dirs(paths)
+BBSPATHS *paths;
+{
+    int i;
+    int ok = 1;
+    char tmp[MAX_PATHNAME];
+
+    strcpy(tmp, paths->msg_path);
+    if (tmp[0] && (tmp[strlen(tmp) - 1] == '\\' || tmp[strlen(tmp) - 1] == '/'))
+        tmp[strlen(tmp) - 1] = 0;
+    ok &= make_dir_if_needed(tmp);
+
+    strcpy(tmp, paths->usr_path);
+    if (tmp[0] && (tmp[strlen(tmp) - 1] == '\\' || tmp[strlen(tmp) - 1] == '/'))
+        tmp[strlen(tmp) - 1] = 0;
+    ok &= make_dir_if_needed(tmp);
+
+    strcpy(tmp, paths->ud_path);
+    if (tmp[0] && (tmp[strlen(tmp) - 1] == '\\' || tmp[strlen(tmp) - 1] == '/'))
+        tmp[strlen(tmp) - 1] = 0;
+    ok &= make_dir_if_needed(tmp);
+
+    strcpy(tmp, paths->log_path);
+    if (tmp[0] && (tmp[strlen(tmp) - 1] == '\\' || tmp[strlen(tmp) - 1] == '/'))
+        tmp[strlen(tmp) - 1] = 0;
+    ok &= make_dir_if_needed(tmp);
+
+    for (i = 0; i < NUM_SECT; i++)
+    {
+        strcpy(tmp, paths->updn_path[i]);
+        if (tmp[0] && (tmp[strlen(tmp) - 1] == '\\' || tmp[strlen(tmp) - 1] == '/'))
+            tmp[strlen(tmp) - 1] = 0;
+        ok &= make_dir_if_needed(tmp);
+    }
+
+    return ok;
+}
+
+static int write_cfginfo_dat(cfg)
+CFGINFO *cfg;
+{
+    FILE *fp;
+
+    fp = fopen("CFGINFO.DAT", "wb");
     if (!fp)
         return 0;
 
-    write_blank_header(fp);
-
-    buf = calloc(1, (unsigned)reclen);
-    if (!buf)
+    if (fwrite(cfg, sizeof(*cfg), 1, fp) != 1)
     {
         fclose(fp);
         return 0;
     }
 
-    for (i = 0; i < count; i++)
-        fwrite(buf, (unsigned)reclen, 1, fp);
-
-    free(buf);
     fclose(fp);
     return 1;
 }
 
-static void prompt_line(prompt, out, len)
-char *prompt;
-char *out;
-int len;
-{
-    data_prompt_line(prompt, out, len);
-}
-
-static int yesno_prompt(prompt, def_yes)
-char *prompt;
-int def_yes;
-{
-    return data_yesno(prompt, def_yes);
-}
-
-/* ------------------------------------------------------------ */
-/* command-line parsing                                         */
-/* ------------------------------------------------------------ */
-
-static void parse_args(argc, argv)
-int argc;
-char *argv[];
-{
-    int i;
-
-    for (i = 1; i < argc; i++)
-    {
-        if (!strnicmp(argv[i], "-m:", 3))
-            opt_msg_base = atol(argv[i] + 3);
-        else if (!strnicmp(argv[i], "-c:", 3))
-            opt_call_no = atol(argv[i] + 3);
-        else if (!strnicmp(argv[i], "-s:", 3))
-            opt_pseudo = atol(argv[i] + 3);
-        else if (!stricmp(argv[i], "-u"))
-            opt_update_ud = 1;
-    }
-}
-
-/* ------------------------------------------------------------ */
-/* parameter file                                               */
-/* ------------------------------------------------------------ */
-
-static int save_bbs_p(paths)
+static int write_bbspaths_cfg(paths)
 BBSPATHS *paths;
 {
     FILE *fp;
     int i;
 
-    fp = fopen("BBS.P", "wt");
+    fp = fopen("BBSPATHS.CFG", "wt");
     if (!fp)
         return 0;
 
     fprintf(fp, "MSG=%s\n", paths->msg_path);
-    fprintf(fp, "USR=%s\n", paths->usr_path);
+    fprintf(fp, "USER=%s\n", paths->usr_path);
     fprintf(fp, "UD=%s\n", paths->ud_path);
     fprintf(fp, "LOG=%s\n", paths->log_path);
 
     for (i = 0; i < NUM_SECT; i++)
-        if (paths->updn_path[i][0])
-            fprintf(fp, "UPDN%02d=%s\n", i, paths->updn_path[i]);
+        fprintf(fp, "UPDN%02d=%s\n", i, paths->updn_path[i]);
 
     fclose(fp);
     return 1;
 }
 
-static void interactive_parameter_file(void)
+static int create_fixed_file(path, reclen)
+char *path;
+int reclen;
 {
-    int i;
-    char line[MAX_PATHNAME];
+    FILE *fp;
+    unsigned char hdr[HDRLEN];
 
-    memset(&g_paths, 0, sizeof(g_paths));
-
-    prompt_line("Drive/path for message files: ", g_paths.msg_path, sizeof(g_paths.msg_path));
-    prompt_line("Drive/path for user files: ", g_paths.usr_path, sizeof(g_paths.usr_path));
-    prompt_line("Drive/path for U/D indexes: ", g_paths.ud_path, sizeof(g_paths.ud_path));
-    prompt_line("Drive/path for log files: ", g_paths.log_path, sizeof(g_paths.log_path));
-
-    puts("Enter up to 16 paths for U/D files");
-    for (i = 0; i < NUM_SECT; i++)
+    fp = fopen(path, "rb");
+    if (fp)
     {
-        sprintf(line, "Drive/path #%d: ", i + 1);
-        prompt_line(line, g_paths.updn_path[i], sizeof(g_paths.updn_path[i]));
-        if (!g_paths.updn_path[i][0])
-            break;
+        fclose(fp);
+        return 1;
     }
 
-    if (save_bbs_p(&g_paths))
-        puts("BBS.P written");
-    else
-        puts("Can't write BBS.P");
+    fp = fopen(path, "wb");
+    if (!fp)
+        return 0;
+
+    memset(hdr, 0, sizeof(hdr));
+    hdr[0] = (unsigned char)(reclen & 0xFF);
+    hdr[1] = (unsigned char)((reclen >> 8) & 0xFF);
+
+    if (fwrite(hdr, 1, sizeof(hdr), fp) != sizeof(hdr))
+    {
+        fclose(fp);
+        return 0;
+    }
+
+    fclose(fp);
+    return 1;
 }
 
-static void interactive_update_ud_paths(void)
+static int create_core_datafiles(paths)
+BBSPATHS *paths;
+{
+    char path[MAX_PATHNAME];
+    int ok = 1;
+
+    join_path(path, paths->msg_path, "MSGHEAD.DAT");
+    ok &= create_fixed_file(path, sizeof(MSGHEAD));
+
+    join_path(path, paths->msg_path, "MSGTEXT.DAT");
+    ok &= create_fixed_file(path, sizeof(MSGTEXT));
+
+    join_path(path, paths->usr_path, "USERDESC.DAT");
+    ok &= create_fixed_file(path, sizeof(USRDESC));
+
+    join_path(path, paths->ud_path, "UDHEAD.DAT");
+    ok &= create_fixed_file(path, sizeof(UDHEAD));
+
+    join_path(path, paths->log_path, "CALLER.DAT");
+    ok &= create_fixed_file(path, sizeof(USRLOG));
+
+    return ok;
+}
+
+static int create_initial_node_files(cfg)
+CFGINFO *cfg;
 {
     int i;
-    char line[MAX_PATHNAME];
+    int max_nodes;
 
-    if (!load_bbs_paths("BBS.P"))
-        memset(&g_paths, 0, sizeof(g_paths));
+    max_nodes = cfg->max_nodes;
+    if (max_nodes <= 0)
+        max_nodes = 1;
+    if (max_nodes > 99)
+        max_nodes = 99;
 
-    puts("Current U/D paths:");
+    for (i = 0; i < max_nodes; i++)
+    {
+        node_create_file(i);
+        node_set_pseudo_counter_file(i, 0L);
+    }
+
+    return 1;
+}
+
+static void prompt_paths(paths)
+BBSPATHS *paths;
+{
+    char tmp[MAX_PATHNAME];
+    int i;
+    char prompt[64];
+
+    strcpy(tmp, paths->msg_path);
+    prompt_line("Message path", paths->msg_path, sizeof(paths->msg_path), tmp);
+    ensure_trailing_slash(paths->msg_path);
+
+    strcpy(tmp, paths->usr_path);
+    prompt_line("User path", paths->usr_path, sizeof(paths->usr_path), tmp);
+    ensure_trailing_slash(paths->usr_path);
+
+    strcpy(tmp, paths->ud_path);
+    prompt_line("Upload/download data path", paths->ud_path, sizeof(paths->ud_path), tmp);
+    ensure_trailing_slash(paths->ud_path);
+
+    strcpy(tmp, paths->log_path);
+    prompt_line("Log path", paths->log_path, sizeof(paths->log_path), tmp);
+    ensure_trailing_slash(paths->log_path);
+
     for (i = 0; i < NUM_SECT; i++)
-        printf("%2d: %s\n", i + 1, g_paths.updn_path[i]);
+    {
+        strcpy(tmp, paths->updn_path[i]);
+        sprintf(prompt, "Section %02d upload path", i);
+        prompt_line(prompt, paths->updn_path[i], sizeof(paths->updn_path[i]), tmp);
+        ensure_trailing_slash(paths->updn_path[i]);
+    }
+}
+
+static void prompt_cfg(cfg)
+CFGINFO *cfg)
+{
+    char tmp[64];
+
+    prompt_line("BBS name", cfg->bbsname, sizeof(cfg->bbsname), cfg->bbsname);
+    prompt_line("Sysop name", cfg->sysopname, sizeof(cfg->sysopname), cfg->sysopname);
+
+    sprintf(tmp, "%d", cfg->max_nodes > 0 ? cfg->max_nodes : 1);
+    prompt_line("Maximum nodes", tmp, sizeof(tmp), tmp);
+    cfg->max_nodes = atoi(tmp);
+    if (cfg->max_nodes <= 0)
+        cfg->max_nodes = 1;
+    if (cfg->max_nodes > 99)
+        cfg->max_nodes = 99;
+
+    sprintf(tmp, "%d", cfg->min_baud > 0 ? cfg->min_baud : 300);
+    prompt_line("Minimum baud", tmp, sizeof(tmp), tmp);
+    cfg->min_baud = atoi(tmp);
+
+    sprintf(tmp, "%d", cfg->max_baud > 0 ? cfg->max_baud : 2400);
+    prompt_line("Maximum baud", tmp, sizeof(tmp), tmp);
+    cfg->max_baud = atoi(tmp);
+
+    sprintf(tmp, "%d", cfg->page_len > 0 ? cfg->page_len : 24);
+    prompt_line("Default page length", tmp, sizeof(tmp), tmp);
+    cfg->page_len = atoi(tmp);
+    if (cfg->page_len <= 0)
+        cfg->page_len = 24;
+}
+
+static void show_summary(paths, cfg)
+BBSPATHS *paths;
+CFGINFO *cfg;
+{
+    int i;
 
     puts("");
-    puts("Enter new paths and press RETURN when finished.");
+    puts(BBS_VERSION);
+    puts("Initialisation summary");
+    puts("----------------------");
+    printf("BBS name      : %s\n", cfg->bbsname);
+    printf("Sysop name    : %s\n", cfg->sysopname);
+    printf("Max nodes     : %d\n", cfg->max_nodes);
+    printf("Min baud      : %d\n", cfg->min_baud);
+    printf("Max baud      : %d\n", cfg->max_baud);
+    printf("Page length   : %d\n", cfg->page_len);
+    printf("MSG path      : %s\n", paths->msg_path);
+    printf("USER path     : %s\n", paths->usr_path);
+    printf("UD path       : %s\n", paths->ud_path);
+    printf("LOG path      : %s\n", paths->log_path);
 
     for (i = 0; i < NUM_SECT; i++)
-    {
-        sprintf(line, "Drive/path #%d: ", i + 1);
-        prompt_line(line, g_paths.updn_path[i], sizeof(g_paths.updn_path[i]));
-        if (!g_paths.updn_path[i][0])
-            break;
-    }
+        printf("UPDN%02d        : %s\n", i, paths->updn_path[i]);
 
-    if (save_bbs_p(&g_paths))
-        puts("BBS.P updated");
-    else
-        puts("Can't update BBS.P");
+    puts("");
 }
 
 /* ------------------------------------------------------------ */
-/* main BBS files                                               */
+/* entry                                                        */
 /* ------------------------------------------------------------ */
-
-static void create_main_bbs_files(void)
-{
-    int max_msg, max_user, max_log, max_ud;
-
-    if (!load_cfginfo("CFGINFO.DAT"))
-        memset(&g_cfg, 0, sizeof(g_cfg));
-
-    max_msg  = g_cfg.max_msg  ? g_cfg.max_msg  : 512;
-    max_user = g_cfg.max_user ? g_cfg.max_user : 256;
-    max_log  = g_cfg.max_log  ? g_cfg.max_log  : 256;
-    max_ud   = g_cfg.max_ud   ? g_cfg.max_ud   : 512;
-
-    puts("Creating main BBS datafiles...");
-
-    create_fixed_dat("MSGHEAD.DAT", sizeof(MSGHEAD), max_msg);
-    create_fixed_dat("MSGTEXT.DAT", sizeof(MSGTEXT), max_msg * 4);
-    create_blank_dat("MSGKEY.DAT");
-
-    create_fixed_dat("USERDESC.DAT", sizeof(USRDESC), max_user);
-    create_blank_dat("USERKEY.DAT");
-
-    create_fixed_dat("UDHEAD.DAT", sizeof(UDHEAD), max_ud);
-    create_blank_dat("UDKEY1.DAT");
-    create_blank_dat("UDKEY2.DAT");
-    create_blank_dat("UDKEY3.DAT");
-
-    create_fixed_dat("CALLER.DAT", sizeof(USRLOG), max_log);
-    create_blank_dat("CALLKEY.DAT");
-
-    puts("Main BBS files created");
-}
-
-/* ------------------------------------------------------------ */
-/* node file creation/update                                    */
-/* ------------------------------------------------------------ */
-
-static void interactive_create_node_file(void)
-{
-    char line[16];
-    int node_num;
-
-    prompt_line("Which node (1-99)? ", line, sizeof(line));
-    if (!line[0])
-        return;
-
-    node_num = atoi(line);
-    if (node_num < 1 || node_num > 99)
-    {
-        puts("Illegal node number");
-        return;
-    }
-
-    node_create_file(node_num);
-    printf("NODE%02d.DAT created\n", node_num);
-}
-
-static void apply_pseudo_counter_change(void)
-{
-    char line[16];
-    int node_num;
-
-    if (opt_pseudo < 0L)
-        return;
-
-    prompt_line("Which node (1-99)? ", line, sizeof(line));
-    if (!line[0])
-        return;
-
-    node_num = atoi(line);
-    if (node_num < 1 || node_num > 99)
-    {
-        puts("Illegal node number");
-        return;
-    }
-
-    node_set_pseudo_counter_file(node_num, opt_pseudo);
-    printf("NODE%02d.DAT pseudo counter set to %ld\n", node_num, opt_pseudo);
-}
-
-/* ------------------------------------------------------------ */
-/* message / caller maintenance                                 */
-/* ------------------------------------------------------------ */
-
-static void renumber_message_base(new_low)
-long new_low;
-{
-    long recno;
-    long next_no;
-    MSGHEAD h;
-    USRDESC u;
-
-    if (new_low < 1L)
-        return;
-
-    if (!open_main_datafiles())
-    {
-        puts("Can't open datafiles");
-        return;
-    }
-
-    next_no = new_low;
-    recno = data_first_msg(&h);
-    while (recno >= 0L)
-    {
-        h.number = next_no++;
-        data_write_msghead(recno, &h);
-        recno = data_next_msg(recno, &h);
-    }
-
-    recno = data_first_user(&u);
-    while (recno >= 0L)
-    {
-        u.high_msg = 0L;
-        data_write_user(recno, &u);
-        recno = data_next_user(recno, &u);
-    }
-
-    close_main_datafiles();
-    printf("Message base renumbered from %ld\n", new_low);
-}
-
-static void set_highest_caller_number(new_no)
-long new_no;
-{
-    printf("Highest caller number set request: %ld\n", new_no);
-    puts("Persistent caller-number header field not yet reconstructed");
-}
-
-/* ------------------------------------------------------------ */
-/* interactive main                                             */
-/* ------------------------------------------------------------ */
-
-static void interactive_main(void)
-{
-    if (yesno_prompt("Generate parameter file? ", 0))
-        interactive_parameter_file();
-
-    if (yesno_prompt("Generate main BBS files? ", 0))
-        create_main_bbs_files();
-
-    if (yesno_prompt("Initialize BBS node file? ", 0))
-        interactive_create_node_file();
-}
 
 int main(argc, argv)
 int argc;
 char *argv[];
 {
-    parse_args(argc, argv);
+    BBSPATHS paths;
+    CFGINFO cfg;
 
-    puts("BBSINIT - BBS-PC! Initialization - 4.20");
-    puts("Copyright (c) 1985,86,87 Micro-Systems Software Inc.");
+    (void)argc;
+    (void)argv;
+
+    puts(BBS_VERSION);
+    puts("System initialisation");
     puts("");
 
-    if (opt_update_ud)
-        interactive_update_ud_paths();
+    init_default_paths(&paths);
+    init_default_cfg(&cfg);
 
-    if (opt_msg_base >= 0L)
-        renumber_message_base(opt_msg_base);
+    if (prompt_yesno("Edit default paths", 1))
+        prompt_paths(&paths);
 
-    if (opt_call_no >= 0L)
-        set_highest_caller_number(opt_call_no);
+    if (prompt_yesno("Edit system configuration", 1))
+        prompt_cfg(&cfg);
 
-    if (opt_pseudo >= 0L)
-        apply_pseudo_counter_change();
+    show_summary(&paths, &cfg);
 
-    if (!opt_update_ud && opt_msg_base < 0L && opt_call_no < 0L && opt_pseudo < 0L)
-        interactive_main();
+    if (!prompt_yesno("Write configuration files", 1))
+    {
+        puts("Aborted");
+        return 1;
+    }
+
+    if (!ensure_runtime_dirs(&paths))
+    {
+        puts("Unable to create one or more runtime directories");
+        return 1;
+    }
+
+    if (!write_cfginfo_dat(&cfg))
+    {
+        puts("Unable to write CFGINFO.DAT");
+        return 1;
+    }
+
+    if (!write_bbspaths_cfg(&paths))
+    {
+        puts("Unable to write BBSPATHS.CFG");
+        return 1;
+    }
+
+    if (!create_core_datafiles(&paths))
+    {
+        puts("Unable to create one or more core data files");
+        return 1;
+    }
+
+    if (!create_initial_node_files(&cfg))
+    {
+        puts("Unable to create one or more node files");
+        return 1;
+    }
+
+    puts("");
+    puts("Initialisation complete");
+    puts("Legacy configuration files written");
+    puts("BBSPATHS.CFG written");
+    puts("");
 
     return 0;
 }
