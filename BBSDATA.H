@@ -1,9 +1,12 @@
 /* BBSDATA.H
  *
- * BBS-PC 4.20 reconstructed common data/header definitions
+ * BBS-PC ! 4.21
  *
- * Updated:
- * - USRDESC.name changed from char name[NAME_LEN] to char name[NAME_LEN+1]
+ * Reconstructed and modernised source
+ * derived from BBS-PC 4.20
+ *
+ * Core data types, on-disk record layouts, runtime state,
+ * constants and globals.
  */
 
 #ifndef BBSDATA_H
@@ -16,303 +19,338 @@
 /* basic types                                                  */
 /* ------------------------------------------------------------ */
 
-#ifndef BYTE_TYPEDEF_DONE
-#define BYTE_TYPEDEF_DONE
+#ifndef byte
 typedef unsigned char  byte;
+#endif
+
+#ifndef ushort
 typedef unsigned short ushort;
+#endif
+
+#ifndef ulong
 typedef unsigned long  ulong;
-typedef signed char    shortint;
 #endif
 
-#ifndef BOOL_TYPEDEF_DONE
-#define BOOL_TYPEDEF_DONE
-typedef int BOOL;
-#endif
-
-#ifndef TRUE
-#define TRUE  1
-#define FALSE 0
-#endif
-
-#ifndef NULL
-#define NULL 0
+#ifndef bits
+typedef unsigned short bits;
 #endif
 
 /* ------------------------------------------------------------ */
-/* general constants                                            */
+/* core limits                                                  */
 /* ------------------------------------------------------------ */
 
-#define NUM_SECT        16
-#define MAX_MENU_ITEMS  64
-#define MAX_MENU_STACK  16
-#define MAX_PATHNAME    80
-#define MAX_PROTO       16
-#define MAX_NODES       99
+#define HDRLEN              128L
+#define MAX_PATHNAME        128
 
-#define NAME_LEN        24
-#define LOC_LEN         24
-#define PHONE_LEN       12
-#define PASS_LEN        12
-#define SECT_LEN        24
-#define TERM_LEN        20
-#define CAT_LEN         40
-#define FILE_LEN        12
-#define DESC_LEN        58
-#define MENU_PROMPT_LEN 80
-#define MENU_TEXT_LEN   96
-#define MENU_PARM_LEN   32
+#define NUM_SECT            16
+#define NUM_MENUSET         2
+#define MAX_REPLY_LINKS     16
+#define MAX_MENU_ITEMS      64
+#define MAX_MENU_STACK      16
 
-/* ------------------------------------------------------------ */
-/* menu record types / opcodes                                  */
-/* ------------------------------------------------------------ */
-
-#define MEN_TYPE_TITLE  0
-#define MEN_TYPE_ITEM   1
-#define MEN_TYPE_IRET   2
-
-#define MF_USER_STATS       0
-#define MF_SECTION_NAMES    1
-#define MF_CHANGE_MASK      2
-#define MF_REGISTER         3
-#define MF_USER_EDIT        4
-#define MF_CALLER_LOG       5
-#define MF_TIME_ON_SYS      6
-#define MF_CHAT_SYSOP       7
-#define MF_EXPERT_TOGGLE    8
-
-#define MF_LEAVE_MSG        9
-#define MF_LEAVE_SYSOP      10
-#define MF_READ_MSGS        11
-#define MF_READ_EMAIL       12
-#define MF_SCAN_MSGS        13
-#define MF_DELETE_MSG       14
-#define MF_PRINT_CAT        15
-#define MF_BROWSE_FILES     16
-#define MF_UPLOAD_FILE      17
-#define MF_UPLOAD_LOCAL     18
-#define MF_DOWNLOAD_FILE    19
-#define MF_READ_FILE        20
-#define MF_KILL_FILE        21
-
-#define MF_ADD_USER         22
-#define MF_DEL_USER         23
-#define MF_CHG_USER         24
-#define MF_PURGE_USERS      25
-#define MF_PURGE_MSGS       26
-#define MF_PRINT_USERS      27
-#define MF_RESET_BULL       28
-#define MF_UPDATE_DEF       29
-#define MF_DEF_SECTIONS     30
-#define MF_DEF_TERMS        31
-#define MF_MODEM_DEF        32
-#define MF_USER_DEF         33
-#define MF_SYS_DEF          34
-#define MF_NODE_DEF         35
-
-#define MF_LIST_PHONE       36
-#define MF_CHG_PHONE        37
-#define MF_DIAL_REMOTE      38
-#define MF_DIAL_UNLISTED    39
-#define MF_UPLOAD_DIRECT    40
-#define MF_DNL_DIRECT       41
-#define MF_KILL_DIRECT      42
-#define MF_DOS_GATE         43
-#define MF_SRCH_CATDESC     44
-#define MF_NEW_FILES        45
-
-#define MF_EXIT_SYS         100
-#define MF_SHOW_MENU        101
-#define MF_RET_LEVELS       102
-#define MF_RET_TOP          103
-#define MF_CALL_MENU        104
-#define MF_GOTO_MENU        105
-#define MF_CLS_TYPE         106
-#define MF_TYPE_FILE        107
-#define MF_CLS_TYPE_NS      108
-#define MF_TYPE_FILE_NS     109
-#define MF_CHG_MENUSET      110
-#define MF_EXEC_EXT         111
+#define NAME_LEN            35
+#define PWD_LEN             15
+#define CITY_LEN            24
+#define SUBJ_LEN            72
+#define CAT_LEN             40
+#define TEXT_LEN            128
+#define MENU_PARM_LEN       12
+#define MENU_TEXT_LEN       80
+#define MENU_PROMPT_LEN     80
+#define NODE_MENU_LEN       12
+#define DISC_REASON_LEN     24
 
 /* ------------------------------------------------------------ */
-/* user / config / runtime records                              */
+/* disk-layout lengths                                          */
+/* ------------------------------------------------------------ */
+
+#define DISK_NAME_LEN       NAME_LEN
+#define DISK_PWD_LEN        PWD_LEN
+#define DISK_CITY_LEN       CITY_LEN
+#define DISK_SUBJ_LEN       SUBJ_LEN
+#define DISK_CAT_LEN        CAT_LEN
+
+/* ------------------------------------------------------------ */
+/* modem / comms                                                */
 /* ------------------------------------------------------------ */
 
 typedef struct {
-    char      name[NAME_LEN+1];
-    char      loc[LOC_LEN+1];
-    char      phone[PHONE_LEN+1];
-    char      pass[PASS_LEN+1];
+    int port;          /* 1 = COM1, 2 = COM2 */
+    int baud;
+    int parity;        /* 'N', 'E', 'O', etc. */
+    int data_bits;     /* 7 / 8 */
+    int stop_bits;     /* 1 / 2 */
+} PARAMS;
 
-    byte      priv;
-    byte      rd_acc;
-    byte      wr_acc;
-    byte      up_acc;
-    byte      dn_acc;
-    byte      sav_sec;
-    byte      menu;
-    byte      term;
-    byte      protocol;
-    byte      expert;
-    byte      ansi;
-    byte      nokill;
-    byte      reserved1;
-
-    shortint  limit;
-    shortint  time_rem;
-    shortint  width;
-    shortint  length;
-    shortint  nuls;
-    shortint  last_call_slot;
-
-    ushort    calls_total;
-    ushort    msg_total;
-    ushort    upl_total;
-    ushort    dnl_total;
-    ushort    bul_flg;
-
-    ulong     last_call;
-    ulong     high_msg;
-
-    ushort    sect_mask;
-    ushort    flags;
-
-    char      reserved[32];
-} USRDESC;
+/* ------------------------------------------------------------ */
+/* configuration                                                */
+/* ------------------------------------------------------------ */
 
 typedef struct {
-    char      sec_name[NUM_SECT][SECT_LEN+1];
-
-    byte      priv[10];
-    byte      rd_acc[10];
-    byte      wr_acc[10];
-    byte      up_acc[10];
-    byte      dn_acc[10];
-    byte      sav_sec[10];
-    byte      menu[10];
-    shortint  limit[10];
-
-    char      syspass[PASS_LEN+1];
-    char      bbs_name[40];
-    char      sysop_name[40];
-
-    ushort    max_msg;
-    ushort    max_user;
-    ushort    max_ud;
-    ushort    max_log;
-
-    ushort    node_num;
-    ushort    total_nodes;
-
-    char      reserved[128];
-} CFGINFO;
-
-typedef struct {
-    ulong     number;
-    char      from[NAME_LEN+1];
-    char      to[NAME_LEN+1];
-    char      subj[40];
-    ulong     date;
-    ushort    flags;
-    ushort    text_start;
-    ushort    text_count;
-    byte      section;
-    byte      reserved1;
-    char      reserved[16];
-} MSGHEAD;
-
-typedef struct {
-    char      text[80];
-} MSGTEXT;
-
-typedef struct {
-    char      cat_name[CAT_LEN];
-    char      filename[FILE_LEN+1];
-    char      desc[DESC_LEN+1];
-    ulong     size;
-    ulong     uploaded;
-    char      owner[NAME_LEN+1];
-    byte      section;
-    byte      flags;
-    ushort    downloads;
-    char      reserved[16];
-} UDHEAD;
-
-typedef struct {
-    char      name[NAME_LEN+1];
-    ulong     when;
-    shortint  node;
-    shortint  baud;
-    char      reserved[16];
-} USRLOG;
-
-typedef struct {
-    char      msg_path[MAX_PATHNAME];
-    char      usr_path[MAX_PATHNAME];
-    char      ud_path[MAX_PATHNAME];
-    char      log_path[MAX_PATHNAME];
-    char      updn_path[NUM_SECT][MAX_PATHNAME];
+    char msg_path[MAX_PATHNAME];
+    char usr_path[MAX_PATHNAME];
+    char ud_path[MAX_PATHNAME];
+    char log_path[MAX_PATHNAME];
+    char updn_path[NUM_SECT][MAX_PATHNAME];
 } BBSPATHS;
 
 typedef struct {
-    int       active;
-    int       number;
-    char      username[NAME_LEN+1];
-    char      status[40];
-    char      menu_name[FILE_LEN+1];
-    ulong     login_time;
-    ulong     last_activity;
-    ulong     msg_count;
-    ulong     file_count;
-    ulong     caller_count;
-    ulong     pseudo_counter;
-} NODEINFO;
+    char bbsname[41];
+    char sysopname[41];
+    char sysop_pass[21];
 
-typedef struct {
-    char      key;
-    char      text[MENU_TEXT_LEN];
-    char      parm[MENU_PARM_LEN];
-    char      access_spec[32];
+    int  node;
+    int  min_baud;
+    int  max_baud;
+    int  page_len;
+    int  max_nodes;
 
-    byte      function;
-    byte      access_mode;
-    byte      rec_type;
-    byte      is_iret;
-    byte      boost;
+    ushort limit[2];           /* guest/member default minutes */
+    byte   priv[2];            /* guest/member default privilege */
+    ushort idle_limit;         /* idle timeout in minutes, 0 = disabled */
 
-    byte      has_lo;
-    byte      has_hi;
-    byte      priv_lo;
-    byte      priv_hi;
+    bits rd_acc[NUM_SECT];
+    bits wr_acc[NUM_SECT];
+    bits up_acc[NUM_SECT];
+    bits dn_acc[NUM_SECT];
+} CFGINFO;
 
-    ushort    section_mask;
+/* ------------------------------------------------------------ */
+/* menu runtime                                                 */
+/* ------------------------------------------------------------ */
 
-    int       in_use;
+typedef struct MENUITEM {
+    char  key;
+    char  text[MENU_TEXT_LEN + 1];
+    char  access_spec[32];
+    char  parm[MAX_PATHNAME];
+    byte  function;
+    byte  access_mode;
+    byte  boost;
+    byte  rec_type;
+    byte  is_iret;
+    byte  in_use;
+
+    byte  has_lo;
+    byte  has_hi;
+    byte  priv_lo;
+    byte  priv_hi;
+
+    bits  section_mask;
 } MENUITEM;
 
-typedef struct {
-    char      filename[FILE_LEN+1];
-    char      prompt[MENU_PROMPT_LEN];
-    byte      display_option;
-    byte      input_mode;
-    int       item_count;
-    MENUITEM  item[MAX_MENU_ITEMS];
+typedef struct MENUFILE {
+    char filename[MAX_PATHNAME];
+    char prompt[MENU_PROMPT_LEN + 1];
+
+    byte display_option;
+    byte input_mode;
+
+    int  item_count;
+    MENUITEM item[MAX_MENU_ITEMS];
 } MENUFILE;
 
 typedef struct {
-    MENUFILE  menu[MAX_MENU_STACK];
-    int       sp;
+    int sp;
+    MENUFILE menu[MAX_MENU_STACK];
 } MENUSTACK;
 
-typedef struct {
-    int       running;
-    int       logged_in;
-    int       local_mode;
-    int       expert;
-    int       time_left;
-    int       sysop_chat;
+/* ------------------------------------------------------------ */
+/* on-disk record structs                                       */
+/* ------------------------------------------------------------ */
 
-    USRDESC   user;
-    long      user_recno;
+/* USERDESC.DAT */
+typedef struct {
+    char   name[DISK_NAME_LEN + 1];
+    char   pwd[DISK_PWD_LEN + 1];
+    char   city[DISK_CITY_LEN + 1];
+
+    ushort lastdate;
+    ushort lasttime;
+
+    ushort calls;
+    ushort uploads;
+    ushort downloads;
+
+    long   highmsgread;
+
+    bits   rd_acc;
+    bits   wr_acc;
+    bits   up_acc;
+    bits   dn_acc;
+    bits   sys_acc;
+    bits   sect_mask;
+
+    ushort time_limit;
+    byte   menu_set;
+
+    byte   protocol;
+    byte   expert;
+    byte   seclevel;
+    byte   dnldratio;
+} USERREC;
+
+/* MSGHEAD.DAT */
+typedef struct {
+    long   number;
+    long   replyto;
+    long   replys[MAX_REPLY_LINKS];
+
+    ushort msgptr;
+    ushort date;
+    ushort time;
+
+    byte   section;
+
+    char   from[DISK_NAME_LEN + 1];
+    char   to[DISK_NAME_LEN + 1];
+    char   subject[DISK_SUBJ_LEN + 1];
+} MSGREC;
+
+/* UDHEAD.DAT */
+typedef struct {
+    char cat_name[DISK_CAT_LEN + 1];
+    byte section;
+} UDREC;
+
+/* NODE%02d.DAT */
+typedef struct {
+    byte   status;
+    byte   wantchat;
+    ushort baud;
+    byte   page_sysop;
+
+    char   user_name[DISK_NAME_LEN + 1];
+    char   user_city[DISK_CITY_LEN + 1];
+    char   current_menu[NODE_MENU_LEN + 1];
+} NODEREC;
+
+/* CALLER.DAT */
+typedef struct {
+    ulong  caller_no;                   /* running log/caller number */
+    byte   node_no;                     /* 1..n */
+    ushort baud;
+    char   parity;
+    byte   data_bits;
+    byte   stop_bits;
+
+    char   name[DISK_NAME_LEN + 1];
+    char   city[DISK_CITY_LEN + 1];
+
+    ushort in_date;
+    ushort in_time;
+    ushort out_date;
+    ushort out_time;
+
+    char   disc_reason[DISC_REASON_LEN + 1];
+
+    ushort msgs_left;                   /* messages entered this call */
+    ushort uploads;                     /* uploads this call */
+    ushort downloads;                   /* downloads this call */
+} USRLOG;
+
+/* MSGTEXT.DAT */
+typedef struct {
+    char text[TEXT_LEN];
+} MSGTEXT;
+
+/* ------------------------------------------------------------ */
+/* runtime structs                                              */
+/* ------------------------------------------------------------ */
+
+typedef struct {
+    char   name[NAME_LEN + 1];
+    char   pwd[PWD_LEN + 1];
+    char   city[CITY_LEN + 1];
+
+    ushort lastdate;
+    ushort lasttime;
+
+    ushort calls;
+    ushort uploads;
+    ushort downloads;
+
+    long   highmsgread;
+
+    bits   rd_acc;
+    bits   wr_acc;
+    bits   up_acc;
+    bits   dn_acc;
+    bits   sys_acc;
+    bits   sect_mask;
+
+    ushort time_limit;
+    byte   menu_set;
+
+    byte   protocol;
+    byte   expert;
+    byte   seclevel;
+    byte   dnldratio;
+} USRDESC;
+
+typedef struct {
+    long   number;
+    long   replyto;
+    long   replys[MAX_REPLY_LINKS];
+
+    ushort msgptr;
+    ushort date;
+    ushort time;
+
+    byte   section;
+
+    char   from[NAME_LEN + 1];
+    char   to[NAME_LEN + 1];
+    char   subject[SUBJ_LEN + 1];
+} MSGHEAD;
+
+typedef struct {
+    char cat_name[CAT_LEN + 1];
+    byte section;
+} UDHEAD;
+
+typedef struct {
+    int  status;
+    int  wantchat;
+    int  baud;
+    int  page_sysop;
+
+    char user_name[NAME_LEN + 1];
+    char user_city[CITY_LEN + 1];
+    char current_menu[NODE_MENU_LEN + 1];
+} NODEINFO;
+
+typedef struct {
+    USRDESC user;
+
+    int  running;
+    int  node;
+    int  local_login;
+    int  logged_in;
+    int  menu_set;
+    int  expert;
+
+    int  page_sysop;
+    int  msgs_left;             /* messages entered this call */
+    int  uploads;               /* uploads this call */
+
+    ulong logon_unix;
+    ulong last_activity_unix;
+
+    ushort prev_lastdate;
+    ushort prev_lasttime;
+
+    int   base_minutes_allowed;
+    int   bonus_minutes;
+    int   ratio_off;
+    int   last_time_warning;
+
+    /* caller-log tracking */
+    long  caller_log_recno;     /* active CALLER.DAT record, -1 if none */
+    ulong caller_no;            /* session caller/log number */
+    ushort start_uploads;       /* lifetime uploads at login */
+    ushort start_downloads;     /* lifetime downloads at login */
+    char  disconnect_reason[DISC_REASON_LEN + 1];
 
     MENUSTACK mstack;
 } BBSSESSION;
@@ -321,42 +359,27 @@ typedef struct {
 /* globals                                                      */
 /* ------------------------------------------------------------ */
 
-extern CFGINFO     g_cfg;
-extern BBSPATHS    g_paths;
-extern BBSSESSION  g_sess;
-extern NODEINFO    g_node;
+extern CFGINFO    g_cfg;
+extern BBSPATHS   g_paths;
+extern BBSSESSION g_sess;
+extern NODEINFO   g_node;
+extern PARAMS     g_modem;
 
-extern FILE *g_fp_msghead;
-extern FILE *g_fp_msgtext;
-extern FILE *g_fp_userdesc;
-extern FILE *g_fp_udhead;
-extern FILE *g_fp_caller;
+extern FILE *g_usrfp;
+extern FILE *g_msgfp;
+extern FILE *g_txtfp;
+extern FILE *g_udfp;
+extern FILE *g_logfp;
 
 /* ------------------------------------------------------------ */
-/* common helper/data APIs                                      */
+/* on-disk record sizes                                         */
 /* ------------------------------------------------------------ */
 
-int  load_cfginfo(char *fname);
-int  load_bbs_paths(char *fname);
-int  open_main_datafiles(void);
-void close_main_datafiles(void);
+#define USERREC_SIZE   ((int)sizeof(USERREC))
+#define MSGREC_SIZE    ((int)sizeof(MSGREC))
+#define UDREC_SIZE     ((int)sizeof(UDREC))
+#define NODEREC_SIZE   ((int)sizeof(NODEREC))
+#define USRLOG_SIZE    ((int)sizeof(USRLOG))
+#define MSGTEXT_SIZE   ((int)sizeof(MSGTEXT))
 
-void data_trim_crlf(char *s);
-void data_prompt_line(char *prompt, char *buf, int len);
-void data_prompt_hidden(char *prompt, char *buf, int len);
-int  data_yesno(char *prompt, int def_yes);
-
-long data_find_user_by_name(char *name, USRDESC *u);
-long data_find_blank_user(void);
-int  data_read_user(long recno, USRDESC *u);
-int  data_write_user(long recno, USRDESC *u);
-long data_first_user(USRDESC *u);
-long data_next_user(long currec, USRDESC *u);
-
-long data_first_msg(MSGHEAD *m);
-long data_next_msg(long currec, MSGHEAD *m);
-int  data_write_msghead(long recno, MSGHEAD *m);
-
-void bbs_pause(void);
-
-#endif
+#endif /* BBSDATA_H */
