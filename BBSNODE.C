@@ -1,424 +1,433 @@
 /* BBSNODE.C
  *
- * First-pass BBS-PC 4.20 node-state module
+ * BBS-PC ! 4.21
  *
- * Implements:
- * - NODE%02d.DAT open/load/save helpers
- * - basic per-node runtime state
- * - pseudo filename counter support
- * - simple node status display/update
+ * Reconstructed and modernised source
+ * derived from BBS-PC 4.20
  *
- * Notes:
- * - Exact original NODExx.DAT layout is not fully recovered yet.
- * - This module uses a conservative reconstructed node record that
- *   can be tightened later from BBS.EXE/manual evidence.
+ * Node status handling.
+ *
+ * This pass makes node number drive:
+ *   node 1 -> NODE01.DAT
+ *   node 2 -> NODE02.DAT
+ *
+ * The on-disk node file uses NODEREC.
+ * Runtime code continues to use NODEINFO.
  */
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <time.h>
 
 #include "bbsdata.h"
 #include "bbsfunc.h"
 
-#define NODE_NAME_LEN   20
-#define NODE_BANNER_LEN 40
-#define NODE_STATUS_LEN 40
+#ifndef NODE_STATUS_WAITING
+#define NODE_STATUS_WAITING   0
+#endif
+
+#ifndef NODE_STATUS_LOGGED_IN
+#define NODE_STATUS_LOGGED_IN 1
+#endif
+
+#ifndef NODE_STATUS_BUSY
+#define NODE_STATUS_BUSY      2
+#endif
 
 /* ------------------------------------------------------------ */
-/* reconstructed node file structure                            */
+/* local helpers                                                */
 /* ------------------------------------------------------------ */
 
-typedef struct {
-    byte  active;                     /* node in use */
-    byte  local;                      /* local console login */
-    byte  chat;                       /* sysop chat enabled */
-    byte  node_num;                   /* node number */
-
-    longint pseudo_ctr;               /* pseudo filename counter */
-    longint caller_no;                /* current caller number */
-
-    char  caller_name[NAME_LEN + 1];  /* current caller name */
-    char  status[NODE_STATUS_LEN];    /* status text */
-    char  banner[NODE_BANNER_LEN];    /* optional node banner */
-
-    ushort login_date;                /* packed login date */
-    ushort login_time;                /* packed login time */
-
-    byte  menu_set;                   /* current menu set */
-    byte  term;                       /* current terminal type */
-    byte  protocol;                   /* current protocol */
-    byte  reserved;
-
-    longint calls_total;              /* node-local counters */
-    longint msgs_total;
-    longint users_total;
-    longint files_total;
-} NODEREC;
-
-static NODEREC g_node;
-static char g_node_fname[NODE_NAME_LEN] = "";
-
-/* ------------------------------------------------------------ */
-
-static void trim_crlf_local(s)
-char *s;
+static int node_selected_number(void)
 {
-    char *p;
+    int node_no;
 
-    p = strchr(s, '\r');
-    if (p) *p = 0;
+    node_no = g_sess.node + 1;
+    if (node_no < 1)
+        node_no = 1;
+    if (node_no > 99)
+        node_no = 99;
 
-    p = strchr(s, '\n');
-    if (p) *p = 0;
+    return node_no;
 }
 
-static ushort pack_date_now(void)
-{
-    time_t t;
-    struct tm *tmx;
-    ushort y, m, d;
-
-    t = time((time_t *)0);
-    tmx = localtime(&t);
-    if (!tmx)
-        return 0;
-
-    y = (ushort)((tmx->tm_year - 80) & 0x7F);
-    m = (ushort)((tmx->tm_mon + 1) & 0x0F);
-    d = (ushort)(tmx->tm_mday & 0x1F);
-
-    return (ushort)((y << 9) | (m << 5) | d);
-}
-
-static ushort pack_time_now(void)
-{
-    time_t t;
-    struct tm *tmx;
-    ushort hh, mm;
-
-    t = time((time_t *)0);
-    tmx = localtime(&t);
-    if (!tmx)
-        return 0;
-
-    hh = (ushort)(tmx->tm_hour & 0x1F);
-    mm = (ushort)(tmx->tm_min & 0x3F);
-
-    return (ushort)((hh << 11) | (mm << 5));
-}
-
-static void make_node_name(out, node_num)
+static void node_make_filename(out, node_no)
 char *out;
-int node_num;
+int node_no;
 {
-    sprintf(out, "NODE%02d.DAT", node_num);
+    sprintf(out, "NODE%02d.DAT", node_no);
 }
 
-static void node_defaults(n)
-NODEREC *n;
+static void node_make_path(out, node_no)
+char *out;
+int node_no;
 {
-    memset(n, 0, sizeof(*n));
+    char fname[32];
 
-    n->active = 0;
-    n->local = 1;
-    n->chat = 1;
-    n->node_num = (byte)g_sess.node_num;
-    n->pseudo_ctr = 0L;
-    n->caller_no = 0L;
-    strcpy(n->status, "Waiting for caller");
-    strcpy(n->banner, "BBS-PC 4.20");
-    n->login_date = 0;
-    n->login_time = 0;
-    n->menu_set = 0;
-    n->term = 0;
-    n->protocol = 0;
-    n->calls_total = 0L;
-    n->msgs_total = 0L;
-    n->users_total = 0L;
-    n->files_total = 0L;
+    node_make_filename(fname, node_no);
+    data_make_data_path(out, fname);
 }
 
-/* ------------------------------------------------------------ */
-/* public load/save                                             */
-/* ------------------------------------------------------------ */
+static void nodeinfo_to_noderec(dst, src)
+NODEREC *dst;
+NODEINFO *src;
+{
+    memset(dst, 0, sizeof(*dst));
 
-int node_open_current(void)
+    dst->status     = (byte)src->status;
+    dst->wantchat   = (byte)src->wantchat;
+    dst->baud       = (ushort)((g_modem.baud > 0) ? g_modem.baud : src->baud);
+    dst->page_sysop = (byte)src->page_sysop;
+
+    strncpy(dst->user_name, src->user_name, DISK_NAME_LEN);
+    dst->user_name[DISK_NAME_LEN] = 0;
+
+    strncpy(dst->user_city, src->user_city, DISK_CITY_LEN);
+    dst->user_city[DISK_CITY_LEN] = 0;
+
+    strncpy(dst->current_menu, src->current_menu, NODE_MENU_LEN);
+    dst->current_menu[NODE_MENU_LEN] = 0;
+}
+
+static void noderec_to_nodeinfo(dst, src)
+NODEINFO *dst;
+NODEREC *src;
+{
+    memset(dst, 0, sizeof(*dst));
+
+    dst->status     = (int)src->status;
+    dst->wantchat   = (int)src->wantchat;
+    dst->baud       = (int)src->baud;
+    dst->page_sysop = (int)src->page_sysop;
+
+    strncpy(dst->user_name, src->user_name, NAME_LEN);
+    dst->user_name[NAME_LEN] = 0;
+
+    strncpy(dst->user_city, src->user_city, CITY_LEN);
+    dst->user_city[CITY_LEN] = 0;
+
+    strncpy(dst->current_menu, src->current_menu, NODE_MENU_LEN);
+    dst->current_menu[NODE_MENU_LEN] = 0;
+}
+
+static int node_open_selected(fp, mode)
+FILE **fp;
+char *mode;
+{
+    char path[MAX_PATHNAME * 2];
+
+    node_make_path(path, node_selected_number());
+    *fp = fopen(path, mode);
+    return (*fp != NULL);
+}
+
+static int node_read_selected(rec)
+NODEREC *rec;
 {
     FILE *fp;
+    char hdr[HDRLEN];
 
-    make_node_name(g_node_fname, g_sess.node_num);
+    if (!rec)
+        return 0;
 
-    fp = fopen(g_node_fname, "rb");
-    if (!fp)
+    if (!node_open_selected(&fp, "rb"))
+        return 0;
+
+    if (fread(hdr, sizeof(hdr), 1, fp) != 1)
     {
-        node_defaults(&g_node);
+        fclose(fp);
+        return 0;
+    }
 
-        fp = fopen(g_node_fname, "wb");
-        if (!fp)
+    if (fread(rec, sizeof(*rec), 1, fp) != 1)
+    {
+        fclose(fp);
+        return 0;
+    }
+
+    fclose(fp);
+    return 1;
+}
+
+static int node_write_selected(rec)
+NODEREC *rec;
+{
+    FILE *fp;
+    char hdr[HDRLEN];
+
+    if (!rec)
+        return 0;
+
+    if (!node_open_selected(&fp, "r+b"))
+    {
+        if (!node_create_file(node_selected_number()))
             return 0;
 
-        fwrite(&g_node, sizeof(g_node), 1, fp);
+        if (!node_open_selected(&fp, "r+b"))
+            return 0;
+    }
+
+    memset(hdr, 0, sizeof(hdr));
+
+    if (fwrite(hdr, sizeof(hdr), 1, fp) != 1)
+    {
+        fclose(fp);
+        return 0;
+    }
+
+    if (fwrite(rec, sizeof(*rec), 1, fp) != 1)
+    {
+        fclose(fp);
+        return 0;
+    }
+
+    fflush(fp);
+    fclose(fp);
+    return 1;
+}
+
+static void node_sync_runtime_from_session(void)
+{
+    g_node.wantchat = g_node.wantchat ? 1 : 0;
+    g_node.page_sysop = g_sess.page_sysop ? 1 : 0;
+    g_node.baud = (g_modem.baud > 0) ? g_modem.baud : 0;
+
+    if (g_sess.logged_in)
+    {
+        g_node.status = NODE_STATUS_LOGGED_IN;
+
+        strncpy(g_node.user_name, g_sess.user.name, NAME_LEN);
+        g_node.user_name[NAME_LEN] = 0;
+
+        strncpy(g_node.user_city, g_sess.user.city, CITY_LEN);
+        g_node.user_city[CITY_LEN] = 0;
+
+        if (g_sess.mstack.sp > 0)
+        {
+            strncpy(g_node.current_menu,
+                    g_sess.mstack.menu[g_sess.mstack.sp - 1].filename,
+                    NODE_MENU_LEN);
+            g_node.current_menu[NODE_MENU_LEN] = 0;
+        }
+        else
+            g_node.current_menu[0] = 0;
+    }
+    else
+    {
+        g_node.status = NODE_STATUS_WAITING;
+        g_node.user_name[0] = 0;
+        g_node.user_city[0] = 0;
+        g_node.current_menu[0] = 0;
+    }
+}
+
+static void node_flush_selected(void)
+{
+    NODEREC rec;
+
+    node_sync_runtime_from_session();
+    nodeinfo_to_noderec(&rec, &g_node);
+    (void)node_write_selected(&rec);
+}
+
+/* ------------------------------------------------------------ */
+/* public node file helpers                                     */
+/* ------------------------------------------------------------ */
+
+int node_create_file(node_no)
+int node_no;
+{
+    char path[MAX_PATHNAME * 2];
+    FILE *fp;
+    char hdr[HDRLEN];
+    NODEREC rec;
+
+    node_make_path(path, node_no);
+
+    fp = fopen(path, "rb");
+    if (fp)
+    {
         fclose(fp);
         return 1;
     }
 
-    memset(&g_node, 0, sizeof(g_node));
-    fread(&g_node, sizeof(g_node), 1, fp);
-    fclose(fp);
-
-    if (g_node.node_num == 0)
-        g_node.node_num = (byte)g_sess.node_num;
-
-    return 1;
-}
-
-int node_save_current(void)
-{
-    FILE *fp;
-
-    if (!g_node_fname[0])
-        make_node_name(g_node_fname, g_sess.node_num);
-
-    fp = fopen(g_node_fname, "wb");
+    fp = fopen(path, "w+b");
     if (!fp)
         return 0;
 
-    fwrite(&g_node, sizeof(g_node), 1, fp);
+    memset(hdr, 0, sizeof(hdr));
+    memset(&rec, 0, sizeof(rec));
+
+    rec.status = NODE_STATUS_WAITING;
+    rec.wantchat = 0;
+    rec.baud = 0;
+    rec.page_sysop = 0;
+
+    if (fwrite(hdr, sizeof(hdr), 1, fp) != 1)
+    {
+        fclose(fp);
+        return 0;
+    }
+
+    if (fwrite(&rec, sizeof(rec), 1, fp) != 1)
+    {
+        fclose(fp);
+        return 0;
+    }
+
+    fflush(fp);
     fclose(fp);
     return 1;
 }
 
-void node_close_current(void)
+int node_set_pseudo_counter_file(node_no, value)
+int node_no;
+long value;
 {
-    g_node.active = 0;
-    strcpy(g_node.status, "Node idle");
-    g_node.caller_name[0] = 0;
-    g_node.login_date = 0;
-    g_node.login_time = 0;
-    g_node.caller_no = 0L;
-    node_save_current();
+    char path[MAX_PATHNAME * 2];
+    FILE *fp;
+
+    node_make_path(path, node_no);
+
+    fp = fopen(path, "ab");
+    if (!fp)
+        return 0;
+
+    fprintf(fp, "COUNTER=%ld\n", value);
+    fclose(fp);
+    return 1;
 }
 
 /* ------------------------------------------------------------ */
-/* runtime state sync                                           */
-/* ------------------------------------------------------------ */
-
-void node_mark_waiting(void)
-{
-    g_node.active = 0;
-    g_node.local = (byte)(g_sess.local_login ? 1 : 0);
-    g_node.chat = (byte)(g_sess.sysop_chat ? 1 : 0);
-    g_node.node_num = (byte)g_sess.node_num;
-    strcpy(g_node.status, "Waiting for caller");
-    g_node.caller_name[0] = 0;
-    g_node.login_date = 0;
-    g_node.login_time = 0;
-    g_node.caller_no = 0L;
-
-    node_save_current();
-}
-
-void node_mark_logged_in(void)
-{
-    g_node.active = 1;
-    g_node.local = (byte)(g_sess.local_login ? 1 : 0);
-    g_node.chat = (byte)(g_sess.sysop_chat ? 1 : 0);
-    g_node.node_num = (byte)g_sess.node_num;
-    g_node.caller_no = (longint)g_sess.caller_no;
-    strncpy(g_node.caller_name, g_sess.user.name, NAME_LEN);
-    g_node.caller_name[NAME_LEN] = 0;
-    strcpy(g_node.status, "Logged in");
-    g_node.login_date = pack_date_now();
-    g_node.login_time = pack_time_now();
-    g_node.menu_set = g_sess.user.menu;
-    g_node.term = g_sess.user.term;
-    g_node.protocol = g_sess.user.protocol;
-    g_node.calls_total++;
-
-    node_save_current();
-}
-
-void node_mark_menu(menu_name)
-char *menu_name;
-{
-    g_node.active = 1;
-
-    if (menu_name && *menu_name)
-    {
-        strncpy(g_node.status, menu_name, NODE_STATUS_LEN - 1);
-        g_node.status[NODE_STATUS_LEN - 1] = 0;
-    }
-    else
-        strcpy(g_node.status, "Menu");
-
-    node_save_current();
-}
-
-void node_mark_message_activity(void)
-{
-    g_node.msgs_total++;
-    strcpy(g_node.status, "Messages");
-    node_save_current();
-}
-
-void node_mark_file_activity(void)
-{
-    g_node.files_total++;
-    strcpy(g_node.status, "Files");
-    node_save_current();
-}
-
-void node_mark_user_activity(void)
-{
-    g_node.users_total++;
-    strcpy(g_node.status, "User maintenance");
-    node_save_current();
-}
-
-void node_set_chat(flag)
-int flag;
-{
-    g_node.chat = (byte)(flag ? 1 : 0);
-    node_save_current();
-}
-
-void node_set_status(text)
-char *text;
-{
-    if (text && *text)
-    {
-        strncpy(g_node.status, text, NODE_STATUS_LEN - 1);
-        g_node.status[NODE_STATUS_LEN - 1] = 0;
-    }
-    else
-        g_node.status[0] = 0;
-
-    node_save_current();
-}
-
-/* ------------------------------------------------------------ */
-/* pseudo filename counter                                      */
-/* ------------------------------------------------------------ */
-
-long node_get_pseudo_counter(void)
-{
-    return g_node.pseudo_ctr;
-}
-
-void node_set_pseudo_counter(v)
-long v;
-{
-    if (v < 0L)
-        v = 0L;
-
-    g_node.pseudo_ctr = v;
-    node_save_current();
-}
-
-void node_bump_pseudo_counter(void)
-{
-    g_node.pseudo_ctr++;
-    node_save_current();
-}
-
-void node_make_pseudo_name(out, ext_num)
-char *out;
-int ext_num;
-{
-    unsigned n;
-
-    n = (unsigned)(g_node.pseudo_ctr & 0xFFFFU);
-    sprintf(out, "FILE%04u.U%d", n, ext_num);
-}
-
-/* ------------------------------------------------------------ */
-/* display                                                      */
-/* ------------------------------------------------------------ */
-
-void node_show_status(void)
-{
-    puts("");
-    printf("BBS-PC 4.20 Node #%d\n", g_sess.node_num);
-    printf("Chat:   %s\n", g_node.chat ? "ON" : "OFF");
-    printf("Mode:   %s\n", g_node.local ? "Local" : "Remote");
-    printf("Calls:  %ld\n", (long)g_node.calls_total);
-    printf("Msgs:   %ld\n", (long)g_node.msgs_total);
-    printf("Users:  %ld\n", (long)g_node.users_total);
-    printf("Files:  %ld\n", (long)g_node.files_total);
-    printf("Pseudo: %ld\n", (long)g_node.pseudo_ctr);
-    printf("State:  %s\n", g_node.status);
-    if (g_node.caller_name[0])
-        printf("Caller: %s\n", g_node.caller_name);
-    puts("");
-}
-
-void node_show_brief_line(void)
-{
-    printf("Node %02d  Chat:%s  Calls:%ld  Msgs:%ld  Users:%ld  Files:%ld  %s\n",
-        g_sess.node_num,
-        g_node.chat ? "Y" : "N",
-        (long)g_node.calls_total,
-        (long)g_node.msgs_total,
-        (long)g_node.users_total,
-        (long)g_node.files_total,
-        g_node.status);
-}
-
-/* ------------------------------------------------------------ */
-/* simple administrative entry points                           */
-/* ------------------------------------------------------------ */
-
-void node_reset_current(void)
-{
-    node_defaults(&g_node);
-    g_node.node_num = (byte)g_sess.node_num;
-    strcpy(g_node.status, "Node reset");
-    node_save_current();
-}
-
-void node_change_banner(void)
-{
-    char line[80];
-
-    printf("Current banner: %s\n", g_node.banner);
-    printf("New banner: ");
-
-    if (fgets(line, sizeof(line), stdin) == NULL)
-        return;
-
-    trim_crlf_local(line);
-    if (!line[0])
-        return;
-
-    strncpy(g_node.banner, line, NODE_BANNER_LEN - 1);
-    g_node.banner[NODE_BANNER_LEN - 1] = 0;
-    node_save_current();
-}
-
-/* ------------------------------------------------------------ */
-/* convenience hooks for startup/shutdown integration           */
+/* runtime node state                                           */
 /* ------------------------------------------------------------ */
 
 void node_startup_init(void)
 {
-    if (!node_open_current())
-    {
-        puts("Can't open node file");
-        node_defaults(&g_node);
-        make_node_name(g_node_fname, g_sess.node_num);
-    }
+    NODEREC rec;
 
-    node_mark_waiting();
+    memset(&g_node, 0, sizeof(g_node));
+    g_node.status = NODE_STATUS_WAITING;
+
+    (void)node_create_file(node_selected_number());
+
+    if (node_read_selected(&rec))
+        noderec_to_nodeinfo(&g_node, &rec);
+
+    g_node.status = NODE_STATUS_WAITING;
+    g_node.wantchat = 0;
+    g_node.page_sysop = 0;
+    g_node.baud = (g_modem.baud > 0) ? g_modem.baud : 0;
+    g_node.user_name[0] = 0;
+    g_node.user_city[0] = 0;
+    g_node.current_menu[0] = 0;
+
+    node_flush_selected();
 }
 
 void node_session_begin(void)
 {
-    node_mark_logged_in();
+    g_node.status = NODE_STATUS_LOGGED_IN;
+    g_node.wantchat = g_node.wantchat ? 1 : 0;
+    g_node.page_sysop = 0;
+    g_node.baud = (g_modem.baud > 0) ? g_modem.baud : 0;
+
+    strncpy(g_node.user_name, g_sess.user.name, NAME_LEN);
+    g_node.user_name[NAME_LEN] = 0;
+
+    strncpy(g_node.user_city, g_sess.user.city, CITY_LEN);
+    g_node.user_city[CITY_LEN] = 0;
+
+    if (g_sess.mstack.sp > 0)
+    {
+        strncpy(g_node.current_menu,
+                g_sess.mstack.menu[g_sess.mstack.sp - 1].filename,
+                NODE_MENU_LEN);
+        g_node.current_menu[NODE_MENU_LEN] = 0;
+    }
+    else
+        g_node.current_menu[0] = 0;
+
+    node_flush_selected();
 }
 
 void node_session_end(void)
 {
-    node_mark_waiting();
+    g_node.status = NODE_STATUS_WAITING;
+    g_node.page_sysop = 0;
+    g_node.baud = (g_modem.baud > 0) ? g_modem.baud : 0;
+    g_node.user_name[0] = 0;
+    g_node.user_city[0] = 0;
+    g_node.current_menu[0] = 0;
+
+    node_flush_selected();
+}
+
+void node_mark_menu(fname)
+char *fname;
+{
+    if (!fname)
+        fname = "";
+
+    strncpy(g_node.current_menu, fname, NODE_MENU_LEN);
+    g_node.current_menu[NODE_MENU_LEN] = 0;
+
+    if (g_sess.logged_in)
+        g_node.status = NODE_STATUS_LOGGED_IN;
+
+    node_flush_selected();
+}
+
+void node_mark_message_activity(void)
+{
+    if (g_sess.logged_in)
+        g_node.status = NODE_STATUS_BUSY;
+
+    node_flush_selected();
+
+    if (g_sess.logged_in)
+    {
+        g_node.status = NODE_STATUS_LOGGED_IN;
+        node_flush_selected();
+    }
+}
+
+void node_mark_file_activity(void)
+{
+    if (g_sess.logged_in)
+        g_node.status = NODE_STATUS_BUSY;
+
+    node_flush_selected();
+
+    if (g_sess.logged_in)
+    {
+        g_node.status = NODE_STATUS_LOGGED_IN;
+        node_flush_selected();
+    }
+}
+
+void node_mark_user_activity(void)
+{
+    if (g_sess.logged_in)
+        g_node.status = NODE_STATUS_BUSY;
+
+    node_flush_selected();
+
+    if (g_sess.logged_in)
+    {
+        g_node.status = NODE_STATUS_LOGGED_IN;
+        node_flush_selected();
+    }
+}
+
+void node_set_chat(on)
+int on;
+{
+    g_node.wantchat = on ? 1 : 0;
+    node_flush_selected();
+}
+
+void do_change_node_defaults(void)
+{
+    puts("Node defaults editor not yet expanded");
 }

@@ -1,30 +1,21 @@
 /* BBSLOGIN.C
  *
- * BBS-PC ! 4.21
- *
- * Reconstructed and modernised source
- * derived from BBS-PC 4.20
+ * BBS-PC! 4.21
  *
  * Login and logout handling.
  *
- * Ownership rules for this module:
- * - owns authentication and account-entry flow
- * - owns caller/user bookkeeping related to login/logout
- * - does not own session orchestration
- *
- * In particular, this module does NOT call:
- * - modem_begin_session()
- * - modem_end_session()
- * - term_start_session()
- * - term_end_session()
- * - node_session_begin()
- * - node_session_end()
+ * Updated:
+ * - caller log records now carry node / comm params / in/out times
+ * - disconnect reason is written at logout
+ * - per-call uploads/downloads/messages are written for BBSINFO-style use
+ * - sanity fixes applied for caller-log wrappers and modem field defaults
  */
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
+#include <time.h>
 
 #include "bbsdata.h"
 #include "bbsfunc.h"
@@ -37,21 +28,57 @@
 #define SYSOP_USER_NAME "SYSOP"
 #endif
 
+#ifndef DEFAULT_GUEST_MINUTES
+#define DEFAULT_GUEST_MINUTES 30
+#endif
+
+#ifndef DEFAULT_USER_MINUTES
+#define DEFAULT_USER_MINUTES 60
+#endif
+
+#ifndef DEFAULT_SYSOP_MINUTES
+#define DEFAULT_SYSOP_MINUTES 0
+#endif
+
+#ifndef SYSOP_SECLEVEL
+#define SYSOP_SECLEVEL 90
+#endif
+
 /* ------------------------------------------------------------ */
 /* local helpers                                                */
 /* ------------------------------------------------------------ */
+
+static long login_caller_count(void)
+{
+    return data_caller_count();
+}
+
+static long login_find_blank_caller(void)
+{
+    return data_find_blank_caller();
+}
 
 static void login_clear_session_user(void)
 {
     memset(&g_sess.user, 0, sizeof(g_sess.user));
     g_sess.logged_in = 0;
     g_sess.local_login = 0;
-}
+    g_sess.logon_unix = 0L;
+    g_sess.last_activity_unix = 0L;
+    g_sess.prev_lastdate = 0;
+    g_sess.prev_lasttime = 0;
+    g_sess.base_minutes_allowed = 0;
+    g_sess.bonus_minutes = 0;
+    g_sess.ratio_off = 0;
+    g_sess.last_time_warning = -1;
 
-static int login_name_is_guest(name)
-char *name;
-{
-    return data_user_match(name, GUEST_USER_NAME);
+    g_sess.caller_log_recno = -1L;
+    g_sess.caller_no = 0L;
+    g_sess.start_uploads = 0;
+    g_sess.start_downloads = 0;
+    g_sess.msgs_left = 0;
+    g_sess.uploads = 0;
+    g_sess.disconnect_reason[0] = 0;
 }
 
 static int login_name_is_sysop(name)
@@ -60,20 +87,32 @@ char *name;
     return data_user_match(name, SYSOP_USER_NAME);
 }
 
+static int login_user_locked_out(u)
+USRDESC *u;
+{
+    if (!u)
+        return 1;
+
+    return u->seclevel == 0;
+}
+
+static void login_show_locked_out(void)
+{
+    puts("Access denied");
+}
+
 static void login_copy_user_into_session(u)
 USRDESC *u;
 {
     g_sess.user = *u;
-
-    if (g_sess.user.expert)
-        g_sess.expert = 1;
-    else
-        g_sess.expert = 0;
+    g_sess.expert = g_sess.user.expert ? 1 : 0;
+    g_sess.menu_set = g_sess.user.menu_set;
 }
 
 static void login_update_session_flags_from_user(void)
 {
     g_sess.expert = g_sess.user.expert ? 1 : 0;
+    g_sess.menu_set = g_sess.user.menu_set;
 }
 
 static void login_prompt_name(out, outlen)
@@ -104,9 +143,6 @@ static int login_password_matches(u, input)
 USRDESC *u;
 char *input;
 {
-    /* Legacy-compatible first pass:
-     * direct case-insensitive compare against stored password field.
-     */
     return data_name_match(u->pwd, input, PWD_LEN);
 }
 
@@ -114,6 +150,17 @@ static void login_mark_new_session_defaults(void)
 {
     g_sess.menu_set = 0;
     g_sess.logged_in = 0;
+    g_sess.page_sysop = 0;
+    g_sess.msgs_left = 0;
+    g_sess.uploads = 0;
+    g_sess.logon_unix = 0L;
+    g_sess.last_activity_unix = 0L;
+    g_sess.prev_lastdate = 0;
+    g_sess.prev_lasttime = 0;
+    g_sess.bonus_minutes = 0;
+    g_sess.ratio_off = 0;
+    g_sess.last_time_warning = -1;
+    g_sess.disconnect_reason[0] = 0;
 }
 
 static void login_set_local_defaults(void)
@@ -134,20 +181,64 @@ static void login_set_user_runtime_defaults(void)
     login_update_session_flags_from_user();
 }
 
+static int login_cfg_default_minutes(is_guest)
+int is_guest;
+{
+    if (is_guest)
+    {
+        if (g_cfg.limit[0] > 0)
+            return (int)g_cfg.limit[0];
+        return DEFAULT_GUEST_MINUTES;
+    }
+
+    if (g_cfg.limit[1] > 0)
+        return (int)g_cfg.limit[1];
+
+    return DEFAULT_USER_MINUTES;
+}
+
+static int login_compute_time_limit(is_guest, is_local_sysop)
+int is_guest;
+int is_local_sysop;
+{
+    int mins;
+
+    if (is_local_sysop)
+        return DEFAULT_SYSOP_MINUTES;
+
+    if (g_sess.user.seclevel >= SYSOP_SECLEVEL)
+        return 0;
+
+    if (g_sess.user.time_limit > 0)
+        return g_sess.user.time_limit;
+
+    mins = login_cfg_default_minutes(is_guest);
+    if (mins < 0)
+        mins = 0;
+
+    return mins;
+}
+
+static void login_apply_session_policy(is_guest, is_local_sysop)
+int is_guest;
+int is_local_sysop;
+{
+    g_sess.base_minutes_allowed =
+        login_compute_time_limit(is_guest, is_local_sysop);
+
+    if (g_sess.base_minutes_allowed < 0)
+        g_sess.base_minutes_allowed = 0;
+}
+
+static void login_preserve_previous_lastcall(void)
+{
+    g_sess.prev_lastdate = g_sess.user.lastdate;
+    g_sess.prev_lasttime = g_sess.user.lasttime;
+}
+
 static void login_bump_user_stats_on_entry(void)
 {
     g_sess.user.calls++;
-    g_sess.user.lastdate = data_pack_date_now();
-    g_sess.user.lasttime = data_pack_time_now();
-    user_save_current();
-}
-
-static void logout_update_user_stats(void)
-{
-    /* Conservative first pass:
-     * persist the current user record as-is on logout.
-     * Time-on-system accumulation can be refined later.
-     */
     g_sess.user.lastdate = data_pack_date_now();
     g_sess.user.lasttime = data_pack_time_now();
     user_save_current();
@@ -174,49 +265,133 @@ static void login_show_local(void)
     puts("Local login granted");
 }
 
+static void login_seed_session_counters(void)
+{
+    g_sess.start_uploads = g_sess.user.uploads;
+    g_sess.start_downloads = g_sess.user.downloads;
+    g_sess.msgs_left = 0;
+    g_sess.uploads = 0;
+    g_sess.disconnect_reason[0] = 0;
+}
+
+static void login_fill_call_record_base(c)
+USRLOG *c;
+{
+    memset(c, 0, sizeof(*c));
+
+    c->caller_no = (ulong)(login_caller_count() + 1L);
+    c->node_no = (byte)(g_sess.node + 1);
+    c->baud = (ushort)((g_modem.baud > 0) ? g_modem.baud : 0);
+    c->parity = (char)(g_modem.parity ? g_modem.parity : 'N');
+    c->data_bits = (byte)((g_modem.data_bits > 0) ? g_modem.data_bits : 8);
+    c->stop_bits = (byte)((g_modem.stop_bits > 0) ? g_modem.stop_bits : 1);
+
+    strncpy(c->name, g_sess.user.name, DISK_NAME_LEN);
+    c->name[DISK_NAME_LEN] = 0;
+
+    strncpy(c->city, g_sess.user.city, DISK_CITY_LEN);
+    c->city[DISK_CITY_LEN] = 0;
+
+    c->in_date = data_pack_date_now();
+    c->in_time = data_pack_time_now();
+}
+
+static void login_begin_caller_log(void)
+{
+    USRLOG c;
+    long recno;
+
+    login_fill_call_record_base(&c);
+
+    recno = login_find_blank_caller();
+    if (recno < 0L)
+        recno = login_caller_count();
+
+    if (!data_write_caller(recno, &c))
+    {
+        g_sess.caller_log_recno = -1L;
+        g_sess.caller_no = 0L;
+        return;
+    }
+
+    g_sess.caller_log_recno = recno;
+    g_sess.caller_no = c.caller_no;
+}
+
+static ushort login_session_downloads_this_call(void)
+{
+    if (g_sess.user.downloads >= g_sess.start_downloads)
+        return (ushort)(g_sess.user.downloads - g_sess.start_downloads);
+
+    return 0;
+}
+
+static ushort login_session_uploads_this_call(void)
+{
+    if (g_sess.user.uploads >= g_sess.start_uploads)
+        return (ushort)(g_sess.user.uploads - g_sess.start_uploads);
+
+    return 0;
+}
+
+static void logout_finish_caller_log(void)
+{
+    USRLOG c;
+
+    if (g_sess.caller_log_recno < 0L)
+        return;
+
+    if (!data_read_caller(g_sess.caller_log_recno, &c))
+        return;
+
+    c.out_date = data_pack_date_now();
+    c.out_time = data_pack_time_now();
+
+    if (g_sess.disconnect_reason[0])
+    {
+        strncpy(c.disc_reason, g_sess.disconnect_reason, DISC_REASON_LEN);
+        c.disc_reason[DISC_REASON_LEN] = 0;
+    }
+
+    c.msgs_left = (ushort)g_sess.msgs_left;
+    c.uploads = login_session_uploads_this_call();
+    c.downloads = login_session_downloads_this_call();
+
+    (void)data_write_caller(g_sess.caller_log_recno, &c);
+}
+
+static void logout_update_user_stats(void)
+{
+    g_sess.user.lastdate = data_pack_date_now();
+    g_sess.user.lasttime = data_pack_time_now();
+    user_save_current();
+}
+
 static int login_try_existing_user(name)
 char *name;
 {
     USRDESC u;
-    char pwd[PWD_LEN + 4];
 
     if (!login_load_named_user(name, &u))
         return 0;
+
+    if (login_user_locked_out(&u))
+    {
+        login_show_locked_out();
+        return 0;
+    }
 
     if (!password_prompt(&u))
         return 0;
 
     login_copy_user_into_session(&u);
+    login_preserve_previous_lastcall();
     login_set_remote_defaults();
     login_set_user_runtime_defaults();
+    login_apply_session_policy(0, 0);
     login_bump_user_stats_on_entry();
-    login_record_call();
-    login_update_lastcall(&g_sess.user);
-    login_show_success(g_sess.user.name);
-    return 1;
-}
-
-static int login_try_existing_user_manual(name)
-char *name;
-{
-    USRDESC u;
-    char pwd[PWD_LEN + 4];
-
-    if (!login_load_named_user(name, &u))
-        return 0;
-
-    if (!login_prompt_password(pwd, sizeof(pwd)))
-        return 0;
-
-    if (!login_password_matches(&u, pwd))
-        return 0;
-
-    login_copy_user_into_session(&u);
-    login_set_remote_defaults();
-    login_set_user_runtime_defaults();
-    login_bump_user_stats_on_entry();
-    login_record_call();
-    login_update_lastcall(&g_sess.user);
+    login_seed_session_counters();
+    login_begin_caller_log();
     login_show_success(g_sess.user.name);
     return 1;
 }
@@ -224,10 +399,20 @@ char *name;
 static int login_try_guest(void)
 {
     USRDESC u;
+    int has_guest_record;
 
-    if (login_load_named_user(GUEST_USER_NAME, &u))
+    has_guest_record = login_load_named_user(GUEST_USER_NAME, &u);
+
+    if (has_guest_record)
     {
+        if (login_user_locked_out(&u))
+        {
+            login_show_locked_out();
+            return 0;
+        }
+
         login_copy_user_into_session(&u);
+        login_preserve_previous_lastcall();
     }
     else
     {
@@ -236,12 +421,22 @@ static int login_try_guest(void)
         u.name[NAME_LEN] = 0;
         u.protocol = 0;
         u.expert = 0;
+        u.seclevel = (g_cfg.priv[0] > 0) ? g_cfg.priv[0] : 1;
+        u.menu_set = 0;
         login_copy_user_into_session(&u);
+        g_sess.prev_lastdate = 0;
+        g_sess.prev_lasttime = 0;
     }
 
     login_set_remote_defaults();
     login_set_user_runtime_defaults();
-    login_record_call();
+    login_apply_session_policy(1, 0);
+
+    if (has_guest_record)
+        login_bump_user_stats_on_entry();
+
+    login_seed_session_counters();
+    login_begin_caller_log();
     login_show_guest();
     return 1;
 }
@@ -249,10 +444,20 @@ static int login_try_guest(void)
 static int login_try_local_sysop(void)
 {
     USRDESC u;
+    int has_sysop_record;
 
-    if (login_load_named_user(SYSOP_USER_NAME, &u))
+    has_sysop_record = login_load_named_user(SYSOP_USER_NAME, &u);
+
+    if (has_sysop_record)
     {
+        if (login_user_locked_out(&u))
+        {
+            login_show_locked_out();
+            return 0;
+        }
+
         login_copy_user_into_session(&u);
+        login_preserve_previous_lastcall();
     }
     else
     {
@@ -261,12 +466,22 @@ static int login_try_local_sysop(void)
         u.name[NAME_LEN] = 0;
         u.protocol = 0;
         u.expert = 1;
+        u.seclevel = SYSOP_SECLEVEL;
+        u.menu_set = 0;
         login_copy_user_into_session(&u);
+        g_sess.prev_lastdate = 0;
+        g_sess.prev_lasttime = 0;
     }
 
     login_set_local_defaults();
     login_set_user_runtime_defaults();
-    login_record_call();
+    login_apply_session_policy(0, 1);
+
+    if (has_sysop_record)
+        login_bump_user_stats_on_entry();
+
+    login_seed_session_counters();
+    login_begin_caller_log();
     login_show_local();
     return 1;
 }
@@ -315,9 +530,6 @@ int login_user(void)
 
 int login_wizard(void)
 {
-    /* Conservative first pass:
-     * local sysop-style entry path.
-     */
     return login_local();
 }
 
@@ -341,7 +553,7 @@ int user_register(void)
     USRDESC u;
     long recno;
 
-    memset(&u, 0, sizeof(u));
+    user_zero(&u);
 
     term_getline("New user name: ", line, sizeof(line));
     data_trim_crlf(line);
@@ -354,7 +566,7 @@ int user_register(void)
         return 0;
     }
 
-    memset(&u, 0, sizeof(u));
+    user_apply_newuser_defaults(&u);
     strncpy(u.name, line, NAME_LEN);
     u.name[NAME_LEN] = 0;
 
@@ -363,11 +575,14 @@ int user_register(void)
     strncpy(u.pwd, line, PWD_LEN);
     u.pwd[PWD_LEN] = 0;
 
-    u.lastdate = data_pack_date_now();
-    u.lasttime = data_pack_time_now();
-    u.protocol = 0;
-    u.expert = 0;
-    u.calls = 1;
+    term_getline("City: ", line, sizeof(line));
+    data_trim_crlf(line);
+    strncpy(u.city, line, CITY_LEN);
+    u.city[CITY_LEN] = 0;
+
+    u.calls = 0;
+    u.lastdate = 0;
+    u.lasttime = 0;
 
     recno = data_find_blank_user();
     if (recno < 0L)
@@ -377,10 +592,14 @@ int user_register(void)
         return 0;
 
     login_copy_user_into_session(&u);
+    g_sess.prev_lastdate = 0;
+    g_sess.prev_lasttime = 0;
     login_set_remote_defaults();
     login_set_user_runtime_defaults();
-    login_record_call();
-    login_update_lastcall(&g_sess.user);
+    login_apply_session_policy(0, 0);
+    login_bump_user_stats_on_entry();
+    login_seed_session_counters();
+    login_begin_caller_log();
 
     puts("Registration complete");
     return 1;
@@ -402,28 +621,8 @@ USRDESC *u;
 
 void login_record_call(void)
 {
-    USRLOG c;
-    long recno;
-    char d[32], t[32];
-
-    memset(&c, 0, sizeof(c));
-
-    strncpy(c.name, g_sess.user.name, NAME_LEN);
-    c.name[NAME_LEN] = 0;
-
-    data_now_strings(d, t);
-    strncpy(c.date, d, sizeof(c.date) - 1);
-    c.date[sizeof(c.date) - 1] = 0;
-    strncpy(c.time, t, sizeof(c.time) - 1);
-    c.time[sizeof(c.time) - 1] = 0;
-
-    c.when = (ulong)time((time_t *)0);
-
-    recno = data_find_blank_caller();
-    if (recno < 0L)
-        recno = data_caller_count();
-
-    (void)data_write_caller(recno, &c);
+    if (g_sess.caller_log_recno < 0L)
+        login_begin_caller_log();
 }
 
 void login_update_lastcall(u)
@@ -447,6 +646,11 @@ void logout_user(void)
         return;
 
     logout_update_user_stats();
+    logout_finish_caller_log();
+
+    g_sess.caller_log_recno = -1L;
+    g_sess.caller_no = 0L;
+    g_sess.disconnect_reason[0] = 0;
 }
 
 void do_register_user(void)
@@ -456,10 +660,43 @@ void do_register_user(void)
 
 void do_callback_user(void)
 {
-    puts("Callback not yet implemented");
+    puts("Callback verification is not available on this system");
 }
 
 void do_lockout_user(void)
 {
-    puts("Lockout not yet implemented");
+    char name[NAME_LEN + 4];
+    USRDESC u;
+    long recno;
+
+    if (!sysop_password_prompt())
+        return;
+
+    term_getline("Lock out user: ", name, sizeof(name));
+    data_trim_crlf(name);
+    if (!name[0])
+        return;
+
+    recno = data_find_user_by_name(name, &u);
+    if (recno < 0L)
+    {
+        puts("User not found");
+        return;
+    }
+
+    if (login_name_is_sysop(u.name))
+    {
+        puts("Cannot lock out SYSOP");
+        return;
+    }
+
+    u.seclevel = 0;
+
+    if (!data_write_user(recno, &u))
+    {
+        puts("Lockout failed");
+        return;
+    }
+
+    puts("User locked out");
 }

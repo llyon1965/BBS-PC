@@ -8,43 +8,25 @@
  * Message subsystem
  *
  * Updated:
- * - stronger message/thread traversal
- * - safe reply-chain walking
- * - broken-link detection
- * - orphaned text-chain protection
- * - conservative purge logic
- *
- * Notes:
- * - This pass keeps the legacy on-disk structures intact.
- * - It does not attempt to redesign message storage.
- * - It assumes:
- *      MSGHEAD.number      = public message number
- *      MSGHEAD.replyto     = parent message number or 0
- *      MSGHEAD.replys[]    = reply message numbers, 0-terminated/unused
- *      MSGHEAD.msgptr      = first MSGTEXT record
- * - Where historical field names differ slightly in your tree, align the
- *   field references in the obvious places.
+ * - original-style "new" logic uses user.highmsgread
+ * - clearer scan vs read behaviour
+ * - reply-chain/thread walking improved
+ * - full-read paths advance highmsgread
  */
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <ctype.h>
 
 #include "bbsdata.h"
 #include "bbsfunc.h"
 
-#ifndef MAX_MSG_SCAN
-#define MAX_MSG_SCAN 32767L
-#endif
-
-#ifndef MAX_REPLY_LINKS
-#define MAX_REPLY_LINKS 16
-#endif
-
 #ifndef MAX_MSG_BODY
 #define MAX_MSG_BODY 8192
 #endif
+
+#define MSGMODE_SCAN   1
+#define MSGMODE_READ   2
 
 /* ------------------------------------------------------------ */
 /* local helpers                                                */
@@ -53,6 +35,9 @@
 static int msg_is_blank(h)
 MSGHEAD *h;
 {
+    if (!h)
+        return 1;
+
     return (h->number == 0L);
 }
 
@@ -78,20 +63,8 @@ static long msg_count(void)
     n = data_msg_count();
     if (n < 0L)
         return 0L;
+
     return n;
-}
-
-static int msg_load_by_recno(recno, h)
-long recno;
-MSGHEAD *h;
-{
-    if (recno < 0L || recno >= msg_count())
-        return 0;
-
-    if (!data_read_msghead(recno, h))
-        return 0;
-
-    return msg_header_valid(h);
 }
 
 static long msg_find_recno_by_number(msgno, out)
@@ -99,45 +72,6 @@ long msgno;
 MSGHEAD *out;
 {
     return data_find_msg_by_number(msgno, out);
-}
-
-static int msg_text_chain_valid(first_recno)
-ushort first_recno;
-{
-    long ntext;
-    long recno;
-    long seen;
-
-    if (first_recno == 0)
-        return 1;
-
-    ntext = data_msgtext_count();
-    if (ntext <= 0L)
-        return 0;
-
-    recno = (long)first_recno;
-    if (recno < 0L || recno >= ntext)
-        return 0;
-
-    seen = 0L;
-    while (recno < ntext)
-    {
-        MSGTEXT t;
-
-        if (!data_read_msgtext(recno, &t))
-            return 0;
-
-        if (!t.text[0])
-            return 1;
-
-        recno++;
-        seen++;
-
-        if (seen > ntext)
-            return 0;
-    }
-
-    return 0;
 }
 
 static int msg_reply_slot_used(v)
@@ -257,6 +191,45 @@ long childno;
     return data_write_msghead(prec, &parent);
 }
 
+static int msg_text_chain_valid(first_recno)
+ushort first_recno;
+{
+    long ntext;
+    long recno;
+    long seen;
+
+    if (first_recno == 0)
+        return 1;
+
+    ntext = data_msgtext_count();
+    if (ntext <= 0L)
+        return 0;
+
+    recno = (long)first_recno;
+    if (recno < 0L || recno >= ntext)
+        return 0;
+
+    seen = 0L;
+    while (recno < ntext)
+    {
+        MSGTEXT t;
+
+        if (!data_read_msgtext(recno, &t))
+            return 0;
+
+        if (!t.text[0])
+            return 1;
+
+        recno++;
+        seen++;
+
+        if (seen > ntext)
+            return 0;
+    }
+
+    return 0;
+}
+
 static int msg_parent_link_consistent(h)
 MSGHEAD *h;
 {
@@ -295,34 +268,6 @@ MSGHEAD *h;
     }
 
     return msg_link_child_to_parent(h->replyto, h->number);
-}
-
-static int msg_reply_link_valid(h, idx)
-MSGHEAD *h;
-int idx;
-{
-    MSGHEAD child;
-    long crec;
-    long childno;
-
-    if (!h || idx < 0 || idx >= MAX_REPLY_LINKS)
-        return 0;
-
-    childno = h->replys[idx];
-    if (!msg_reply_slot_used(childno))
-        return 1;
-
-    if (childno == h->number)
-        return 0;
-
-    crec = msg_find_recno_by_number(childno, &child);
-    if (crec < 0L)
-        return 0;
-
-    if (child.replyto != h->number)
-        return 0;
-
-    return 1;
 }
 
 static int msg_repair_reply_links(h)
@@ -409,13 +354,102 @@ MSGHEAD *h;
     return 1;
 }
 
+static int msg_is_new_for_user(h)
+MSGHEAD *h;
+{
+    if (!h)
+        return 0;
+
+    return h->number > g_sess.user.highmsgread;
+}
+
+static void msg_mark_read(h)
+MSGHEAD *h;
+{
+    if (!h)
+        return;
+
+    if (h->number > g_sess.user.highmsgread)
+    {
+        g_sess.user.highmsgread = h->number;
+        (void)user_save_current();
+    }
+}
+
+static int msg_is_email_to_current_user(h)
+MSGHEAD *h;
+{
+    if (!h)
+        return 0;
+
+    return data_user_match(h->to, g_sess.user.name);
+}
+
+static int msg_is_thread_root(h)
+MSGHEAD *h;
+{
+    if (!h)
+        return 0;
+
+    if (h->replyto <= 0L)
+        return 1;
+
+    if (h->replyto == h->number)
+        return 1;
+
+    return 0;
+}
+
+static long msg_find_thread_root(msgno)
+long msgno;
+{
+    MSGHEAD h;
+    long seen;
+    long current;
+
+    current = msgno;
+    seen = 0L;
+
+    while (seen < msg_count())
+    {
+        if (msg_find_recno_by_number(current, &h) < 0L)
+            return msgno;
+
+        if (h.replyto <= 0L || h.replyto == h.number)
+            return h.number;
+
+        current = h.replyto;
+        seen++;
+    }
+
+    return msgno;
+}
+
+static int msg_any_new_in_thread(msgno)
+long msgno;
+{
+    MSGHEAD h;
+    long recno;
+    int i;
+
+    recno = msg_find_recno_by_number(msgno, &h);
+    if (recno < 0L)
+        return 0;
+
+    if (msg_is_new_for_user(&h))
+        return 1;
+
+    for (i = 0; i < MAX_REPLY_LINKS; i++)
+        if (h.replys[i] > 0L && msg_any_new_in_thread(h.replys[i]))
+            return 1;
+
+    return 0;
+}
+
 static void msg_show_header(h)
 MSGHEAD *h;
 {
     char d[32], t[32];
-
-    if (!h)
-        return;
 
     data_unpack_date(h->date, d);
     data_unpack_time(h->time, t);
@@ -444,48 +478,149 @@ MSGHEAD *h;
         puts("(No message text)");
 }
 
-static int msg_read_one_by_number(msgno)
+static void msg_show_thread_summary(h, depth)
+MSGHEAD *h;
+int depth;
+{
+    char d[32], t[32];
+    int i;
+
+    data_unpack_date(h->date, d);
+    data_unpack_time(h->time, t);
+
+    for (i = 0; i < depth; i++)
+        printf("  ");
+
+    printf("#%ld %-12s -> %-12s %-24s %s %s",
+           h->number, h->from, h->to, h->subject, d, t);
+
+    if (msg_is_new_for_user(h))
+        printf(" [NEW]");
+
+    puts("");
+}
+
+static int msg_continue_prompt(void)
+{
+    return term_yesno("Continue (Y/N)? ", 1);
+}
+
+static int msg_show_one(h, mode, depth)
+MSGHEAD *h;
+int mode;
+int depth;
+{
+    if (mode == MSGMODE_SCAN)
+    {
+        msg_show_thread_summary(h, depth);
+        return 1;
+    }
+
+    msg_show_header(h);
+    msg_show_body(h);
+    puts("");
+
+    msg_mark_read(h);
+
+    return msg_continue_prompt();
+}
+
+static int msg_display_thread_from_number(msgno, mode, depth, new_only)
 long msgno;
+int mode;
+int depth;
+int new_only;
 {
     MSGHEAD h;
     long recno;
+    int i;
+    int show_this;
 
     recno = msg_find_recno_by_number(msgno, &h);
     if (recno < 0L)
-        return 0;
+        return 1;
 
     (void)msg_validate_and_repair_header(recno, &h);
 
-    msg_show_header(&h);
-    msg_show_body(&h);
+    show_this = (!new_only || msg_is_new_for_user(&h));
+
+    if (show_this)
+    {
+        if (!msg_show_one(&h, mode, depth))
+            return 0;
+    }
+
+    for (i = 0; i < MAX_REPLY_LINKS; i++)
+    {
+        if (h.replys[i] > 0L)
+        {
+            if (!msg_display_thread_from_number(h.replys[i],
+                                                mode,
+                                                show_this ? depth + 1 : depth,
+                                                new_only))
+                return 0;
+        }
+    }
+
     return 1;
 }
 
-static long msg_next_visible_after(cur_msgno)
-long cur_msgno;
+static int msg_display_roots(mode, new_only)
+int mode;
+int new_only;
 {
     long i, n;
     MSGHEAD h;
-    long best;
 
     n = msg_count();
-    best = 0L;
-
     for (i = 0L; i < n; i++)
     {
         if (!data_read_msghead(i, &h))
             continue;
         if (!msg_header_valid(&h))
             continue;
+        if (!msg_is_thread_root(&h))
+            continue;
 
-        if (h.number > cur_msgno)
-        {
-            if (!best || h.number < best)
-                best = h.number;
-        }
+        if (new_only && !msg_any_new_in_thread(h.number))
+            continue;
+
+        if (!msg_display_thread_from_number(h.number, mode, 0, new_only))
+            return 0;
     }
 
-    return best;
+    return 1;
+}
+
+static int msg_display_email(mode, new_only)
+int mode;
+int new_only;
+{
+    long i, n;
+    MSGHEAD h;
+
+    n = msg_count();
+    for (i = 0L; i < n; i++)
+    {
+        if (!data_read_msghead(i, &h))
+            continue;
+        if (!msg_header_valid(&h))
+            continue;
+        if (!msg_is_email_to_current_user(&h))
+            continue;
+        if (new_only && !msg_is_new_for_user(&h))
+            continue;
+
+        if (!msg_show_one(&h, mode, 0))
+            return 0;
+    }
+
+    return 1;
+}
+
+static long msg_next_number(void)
+{
+    return data_highest_msg_number() + 1L;
 }
 
 static int msg_append_new_header(h, out_recno)
@@ -505,11 +640,6 @@ long *out_recno;
         *out_recno = recno;
 
     return 1;
-}
-
-static long msg_next_number(void)
-{
-    return data_highest_msg_number() + 1L;
 }
 
 static int msg_compose_common(h)
@@ -600,29 +730,6 @@ long msgno;
     return data_write_msghead(recno, &h);
 }
 
-static int msg_reply_chain_walk(startno, level)
-long startno;
-int level;
-{
-    MSGHEAD h;
-    long recno;
-    int i;
-
-    recno = msg_find_recno_by_number(startno, &h);
-    if (recno < 0L)
-        return 0;
-
-    for (i = 0; i < level; i++)
-        printf("  ");
-    printf("#%ld %s -> %s : %s\n", h.number, h.from, h.to, h.subject);
-
-    for (i = 0; i < MAX_REPLY_LINKS; i++)
-        if (h.replys[i] > 0L)
-            (void)msg_reply_chain_walk(h.replys[i], level + 1);
-
-    return 1;
-}
-
 static int msg_repair_all_threads(void)
 {
     long i, n;
@@ -674,6 +781,8 @@ void do_leave_message_to_sysop(void)
 {
     MSGHEAD h;
     long recno;
+    char body[MAX_MSG_BODY];
+    ushort firstptr;
 
     memset(&h, 0, sizeof(h));
     h.number = msg_next_number();
@@ -687,33 +796,28 @@ void do_leave_message_to_sysop(void)
 
     term_getline("Subject: ", h.subject, sizeof(h.subject));
 
+    puts("Enter message text. End with a single '.' line.");
+    body[0] = 0;
+
+    for (;;)
     {
-        char body[MAX_MSG_BODY];
-        ushort firstptr;
-
-        puts("Enter message text. End with a single '.' line.");
-        body[0] = 0;
-
-        for (;;)
-        {
-            char tmp[256];
-            term_getline("", tmp, sizeof(tmp));
-            if (!strcmp(tmp, "."))
-                break;
-            if ((strlen(body) + strlen(tmp) + 3) >= sizeof(body))
-                break;
-            strcat(body, tmp);
-            strcat(body, "\n");
-        }
-
-        if (!data_store_message_text(body, &firstptr))
-        {
-            puts("Unable to store message text");
-            return;
-        }
-
-        h.msgptr = firstptr;
+        char tmp[256];
+        term_getline("", tmp, sizeof(tmp));
+        if (!strcmp(tmp, "."))
+            break;
+        if ((strlen(body) + strlen(tmp) + 3) >= sizeof(body))
+            break;
+        strcat(body, tmp);
+        strcat(body, "\n");
     }
+
+    if (!data_store_message_text(body, &firstptr))
+    {
+        puts("Unable to store message text");
+        return;
+    }
+
+    h.msgptr = firstptr;
 
     if (!msg_append_new_header(&h, &recno))
     {
@@ -731,70 +835,44 @@ void do_leave_message_to_name(void)
 
 void do_read_messages(void)
 {
-    long msgno;
-
     if (!msg_repair_all_threads())
         puts("Warning: some message links could not be repaired");
 
-    msgno = 0L;
-    for (;;)
-    {
-        msgno = msg_next_visible_after(msgno);
-        if (!msgno)
-            break;
+    (void)msg_display_roots(MSGMODE_READ, 0);
+}
 
-        if (!msg_read_one_by_number(msgno))
-            continue;
+void do_read_new_messages(void)
+{
+    if (!msg_repair_all_threads())
+        puts("Warning: some message links could not be repaired");
 
-        if (term_yesno("Continue (Y/N)? ", 1))
-            continue;
-        break;
-    }
+    (void)msg_display_roots(MSGMODE_READ, 1);
 }
 
 void do_read_email(void)
 {
-    long i, n;
-    MSGHEAD h;
+    (void)msg_display_email(MSGMODE_READ, 0);
+}
 
-    n = msg_count();
-    for (i = 0L; i < n; i++)
-    {
-        if (!data_read_msghead(i, &h))
-            continue;
-        if (!msg_header_valid(&h))
-            continue;
-        if (!data_user_match(h.to, g_sess.user.name))
-            continue;
-
-        (void)msg_validate_and_repair_header(i, &h);
-        msg_show_header(&h);
-        msg_show_body(&h);
-
-        if (!term_yesno("Continue (Y/N)? ", 1))
-            break;
-    }
+void do_read_new_email(void)
+{
+    (void)msg_display_email(MSGMODE_READ, 1);
 }
 
 void do_scan_messages(void)
 {
-    long i, n;
-    MSGHEAD h;
-
     if (!msg_repair_all_threads())
         puts("Warning: some message links could not be repaired");
 
-    n = msg_count();
-    for (i = 0L; i < n; i++)
-    {
-        if (!data_read_msghead(i, &h))
-            continue;
-        if (!msg_header_valid(&h))
-            continue;
+    (void)msg_display_roots(MSGMODE_SCAN, 0);
+}
 
-        printf("#%ld  %-20s -> %-20s  %s\n",
-               h.number, h.from, h.to, h.subject);
-    }
+void do_scan_new_messages(void)
+{
+    if (!msg_repair_all_threads())
+        puts("Warning: some message links could not be repaired");
+
+    (void)msg_display_roots(MSGMODE_SCAN, 1);
 }
 
 void do_reply_message(void)
@@ -803,8 +881,11 @@ void do_reply_message(void)
     long parentno;
     long parentrec;
     long childrec;
+    long rootno;
     MSGHEAD parent;
     MSGHEAD child;
+    char body[MAX_MSG_BODY];
+    ushort firstptr;
 
     term_getline("Reply to message number: ", line, sizeof(line));
     parentno = atol(line);
@@ -818,6 +899,10 @@ void do_reply_message(void)
         return;
     }
 
+    rootno = msg_find_thread_root(parent.number);
+    if (rootno <= 0L)
+        rootno = parent.number;
+
     memset(&child, 0, sizeof(child));
     child.number = msg_next_number();
     child.date = data_pack_date_now();
@@ -829,45 +914,34 @@ void do_reply_message(void)
     strncpy(child.to, parent.from, NAME_LEN);
     child.to[NAME_LEN] = 0;
 
-    {
-        char subj[SUBJ_LEN + 8];
-        if (!strnicmp(parent.subject, "Re:", 3))
-            strncpy(subj, parent.subject, sizeof(subj) - 1);
-        else
-            sprintf(subj, "Re: %s", parent.subject);
+    if (!strnicmp(parent.subject, "Re:", 3))
+        strncpy(child.subject, parent.subject, SUBJ_LEN);
+    else
+        sprintf(child.subject, "Re: %s", parent.subject);
+    child.subject[SUBJ_LEN] = 0;
 
-        subj[sizeof(subj) - 1] = 0;
-        strncpy(child.subject, subj, SUBJ_LEN);
-        child.subject[SUBJ_LEN] = 0;
+    puts("Enter reply text. End with a single '.' line.");
+    body[0] = 0;
+
+    for (;;)
+    {
+        char tmp[256];
+        term_getline("", tmp, sizeof(tmp));
+        if (!strcmp(tmp, "."))
+            break;
+        if ((strlen(body) + strlen(tmp) + 3) >= sizeof(body))
+            break;
+        strcat(body, tmp);
+        strcat(body, "\n");
     }
 
+    if (!data_store_message_text(body, &firstptr))
     {
-        char body[MAX_MSG_BODY];
-        ushort firstptr;
-
-        puts("Enter reply text. End with a single '.' line.");
-        body[0] = 0;
-
-        for (;;)
-        {
-            char tmp[256];
-            term_getline("", tmp, sizeof(tmp));
-            if (!strcmp(tmp, "."))
-                break;
-            if ((strlen(body) + strlen(tmp) + 3) >= sizeof(body))
-                break;
-            strcat(body, tmp);
-            strcat(body, "\n");
-        }
-
-        if (!data_store_message_text(body, &firstptr))
-        {
-            puts("Unable to store reply text");
-            return;
-        }
-
-        child.msgptr = firstptr;
+        puts("Unable to store reply text");
+        return;
     }
+
+    child.msgptr = firstptr;
 
     if (!msg_append_new_header(&child, &childrec))
     {

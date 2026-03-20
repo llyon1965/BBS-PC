@@ -1,22 +1,15 @@
 /* BBSUSER.C
  *
- * First-pass BBS-PC 4.20 user record module
+ * BBS-PC ! 4.21
  *
- * Refactored to use BBSDATA.C / BBSISAM.C helpers:
- * - data_prompt_line()
- * - data_yesno()
- * - data_find_user_by_name()
- * - data_read_user() / data_write_user()
- * - data_first_caller() / data_next_caller()
- * - data_user_match()
+ * Reconstructed and modernised source
+ * derived from BBS-PC 4.20
  *
- * Implements:
- * - change/examine current user record
- * - simple user statistics display
- * - section-name display
- * - section mask editing
- * - expert toggle
- * - caller-log printing
+ * User subsystem.
+ *
+ * This pass keeps higher-level code working with USRDESC only,
+ * while on-disk fidelity is handled underneath by BBSDATA.C
+ * and BBSISAM.C through USERREC conversions.
  */
 
 #include <stdio.h>
@@ -26,458 +19,535 @@
 #include "bbsdata.h"
 #include "bbsfunc.h"
 
-/* ------------------------------------------------------------ */
+#ifndef DEFAULT_NEWUSER_SECLEVEL
+#define DEFAULT_NEWUSER_SECLEVEL 10
+#endif
 
-static long find_current_user_recno(void)
-{
-    USRDESC u;
-    return data_find_user_by_name(g_sess.user.name, &u);
-}
+#ifndef DEFAULT_NEWUSER_PROTOCOL
+#define DEFAULT_NEWUSER_PROTOCOL 0
+#endif
 
-static void save_current_user(void)
-{
-    long recno;
-
-    recno = find_current_user_recno();
-    if (recno < 0L)
-    {
-        puts("Can't locate current user record");
-        return;
-    }
-
-    if (!data_write_user(recno, &g_sess.user))
-        puts("Can't write membership file");
-}
-
-static void show_term_name(term)
-int term;
-{
-    if (term >= 0 && term < NUM_TERM && g_cfg.trmnl[term].name[0])
-        printf("%s", g_cfg.trmnl[term].name);
-    else
-        printf("Terminal %d", term);
-}
-
-static void show_access_bits(label, mask)
-char *label;
-bits mask;
-{
-    int i;
-
-    printf("%-12s ", label);
-    for (i = 0; i < NUM_SECT; i++)
-        putchar((mask & (1 << i)) ? ('A' + i) : '.');
-    putchar('\n');
-}
+#ifndef DEFAULT_NEWUSER_MENUSET
+#define DEFAULT_NEWUSER_MENUSET 0
+#endif
 
 /* ------------------------------------------------------------ */
-/* displayed information                                        */
+/* shared helpers used by login/user flows                      */
 /* ------------------------------------------------------------ */
 
-void do_user_statistics(void)
-{
-    puts("");
-    puts("User statistics:");
-    printf("Name            %s\n", g_sess.user.name);
-    printf("Location        %s\n", g_sess.user.loc);
-    printf("Privilege       %u\n", (unsigned)g_sess.user.priv);
-    printf("Calls total     %d\n", (int)g_sess.user.calls_total);
-    printf("Messages left   %d\n", (int)g_sess.user.msg_total);
-    printf("Uploads total   %d\n", (int)g_sess.user.upl_total);
-    printf("Downloads total %d\n", (int)g_sess.user.dnl_total);
-    printf("High msg read   %ld\n", (long)g_sess.user.high_msg);
-    printf("Menu set        %u\n", (unsigned)g_sess.user.menu);
-    printf("Saved section   %u\n", (unsigned)g_sess.user.sav_sec);
-    printf("Protocol        %u\n", (unsigned)g_sess.user.protocol);
-    printf("Width           %u\n", (unsigned)g_sess.user.width);
-    printf("Page length     %u\n", (unsigned)g_sess.user.length);
-    printf("NULS            %u\n", (unsigned)g_sess.user.nuls);
-    printf("Time remaining  %d\n", (int)g_sess.time_left);
-
-    printf("Terminal        ");
-    show_term_name(g_sess.user.term);
-    putchar('\n');
-
-    printf("Expert          %s\n", g_sess.user.expert ? "Yes" : "No");
-    printf("Linefeeds       %s\n", g_sess.user.linefeed ? "Yes" : "No");
-    printf("Callback        %s\n", g_sess.user.callback ? "Yes" : "No");
-    printf("Guest           %s\n", g_sess.user.guest ? "Yes" : "No");
-
-    show_access_bits("Read access", g_sess.user.rd_acc);
-    show_access_bits("Write access", g_sess.user.wr_acc);
-    show_access_bits("Upload access", g_sess.user.up_acc);
-    show_access_bits("Down access", g_sess.user.dn_acc);
-
-    bbs_pause();
-}
-
-void do_section_names(void)
-{
-    int i;
-
-    puts("");
-    puts("Section names:");
-    for (i = 0; i < NUM_SECT; i++)
-        printf("%c: %s\n",
-            'A' + i,
-            g_cfg.sec_name[i][0] ? g_cfg.sec_name[i] : "(unnamed)");
-
-    bbs_pause();
-}
-
-/* ------------------------------------------------------------ */
-/* section mask editing                                         */
-/* ------------------------------------------------------------ */
-
-static void show_mask_editor(mask)
-bits mask;
-{
-    int i;
-
-    puts("");
-    puts("Current section mask:");
-    for (i = 0; i < NUM_SECT; i++)
-        printf("%c %-20s %s\n",
-            'A' + i,
-            g_cfg.sec_name[i][0] ? g_cfg.sec_name[i] : "(unnamed)",
-            (mask & (1 << i)) ? "ON" : "OFF");
-    puts("");
-    puts("Enter section letter to toggle, RETURN to finish.");
-}
-
-void do_change_section_mask(void)
-{
-    char line[16];
-    int sec;
-
-    for (;;)
-    {
-        show_mask_editor(g_sess.user.rd_acc);
-        data_prompt_line("Section? ", line, sizeof(line));
-
-        if (!line[0])
-            break;
-
-        if (line[0] >= 'a' && line[0] <= 'z')
-            line[0] -= 32;
-
-        if (line[0] < 'A' || line[0] >= ('A' + NUM_SECT))
-            continue;
-
-        sec = line[0] - 'A';
-        g_sess.user.rd_acc ^= (1 << sec);
-    }
-
-    save_current_user();
-}
-
-/* ------------------------------------------------------------ */
-/* user record editor                                           */
-/* ------------------------------------------------------------ */
-
-static void copy_term_defaults_to_user(u)
+void user_zero(u)
 USRDESC *u;
 {
-    int t;
-
-    t = u->term;
-    if (t < 0 || t >= NUM_TERM)
-        t = 0;
-
-    u->nuls = g_cfg.trmnl[t].nuls;
-    u->protocol = g_cfg.trmnl[t].protocol;
-    u->width = 80;
-    u->length = g_cfg.trmnl[t].page[0] ? g_cfg.trmnl[t].page[0] : 24;
-    memcpy(u->cls, g_cfg.trmnl[t].cls, 3);
-    memcpy(u->bs, g_cfg.trmnl[t].bs, 3);
-    u->linefeed = g_cfg.trmnl[t].linefeed ? 1 : 0;
-}
-
-static void user_edit_name(void)
-{
-    char line[NAME_LEN + 2];
-
-    data_prompt_line("Your name: ", line, sizeof(line));
-    if (line[0])
-    {
-        strncpy(g_sess.user.name, line, NAME_LEN - 1);
-        g_sess.user.name[NAME_LEN - 1] = 0;
-    }
-}
-
-static void user_edit_location(void)
-{
-    char line[LOC_LEN + 2];
-
-    data_prompt_line("City, State: ", line, sizeof(line));
-    if (line[0])
-    {
-        strncpy(g_sess.user.loc, line, LOC_LEN);
-        g_sess.user.loc[LOC_LEN] = 0;
-    }
-}
-
-static void user_edit_phone(void)
-{
-    char line[PHONE_LEN + 2];
-
-    data_prompt_line("Phone number: ", line, sizeof(line));
-    if (line[0])
-    {
-        strncpy(g_sess.user.phone, line, PHONE_LEN);
-        g_sess.user.phone[PHONE_LEN] = 0;
-    }
-}
-
-static void user_edit_password(void)
-{
-    char line[PASS_LEN + 2];
-
-    data_prompt_line("Password: ", line, sizeof(line));
-    if (line[0])
-    {
-        strncpy(g_sess.user.pass, line, PASS_LEN);
-        g_sess.user.pass[PASS_LEN] = 0;
-    }
-}
-
-static void user_edit_terminal(void)
-{
-    char line[16];
-    int i, t;
-
-    puts("");
-    puts("Terminal types:");
-    for (i = 0; i < NUM_TERM; i++)
-        if (g_cfg.trmnl[i].name[0])
-            printf("%d: %s\n", i, g_cfg.trmnl[i].name);
-
-    data_prompt_line("Terminal? ", line, sizeof(line));
-    if (!line[0])
+    if (!u)
         return;
 
-    t = atoi(line);
-    if (t < 0 || t >= NUM_TERM)
+    memset(u, 0, sizeof(*u));
+}
+
+static int user_default_member_seclevel(void)
+{
+    if (g_cfg.priv[1] > 0)
+        return (int)g_cfg.priv[1];
+
+    return DEFAULT_NEWUSER_SECLEVEL;
+}
+
+static int user_default_member_minutes(void)
+{
+    if (g_cfg.limit[1] > 0)
+        return (int)g_cfg.limit[1];
+
+    return 0;
+}
+
+void user_apply_newuser_defaults(u)
+USRDESC *u;
+{
+    int i;
+
+    if (!u)
         return;
 
-    g_sess.user.term = (byte)t;
-    copy_term_defaults_to_user(&g_sess.user);
-}
+    user_zero(u);
 
-static void user_edit_protocol(void)
-{
-    char line[16];
+    u->protocol    = DEFAULT_NEWUSER_PROTOCOL;
+    u->expert      = 0;
+    u->seclevel    = (byte)user_default_member_seclevel();
+    u->dnldratio   = 0;
+    u->menu_set    = DEFAULT_NEWUSER_MENUSET;
+    u->time_limit  = (ushort)user_default_member_minutes();
+    u->highmsgread = 0L;
 
-    data_prompt_line("Protocol number? ", line, sizeof(line));
-    if (line[0])
-        g_sess.user.protocol = (byte)atoi(line);
-}
+    u->rd_acc = 0;
+    u->wr_acc = 0;
+    u->up_acc = 0;
+    u->dn_acc = 0;
+    u->sys_acc = 0;
+    u->sect_mask = 0;
 
-static void user_edit_menu_set(void)
-{
-    char line[16];
-
-    data_prompt_line("Menu set? ", line, sizeof(line));
-    if (line[0])
-        g_sess.user.menu = (byte)atoi(line);
-}
-
-static void user_edit_saved_section(void)
-{
-    char line[16];
-
-    data_prompt_line("Saved section? ", line, sizeof(line));
-    if (line[0])
-        g_sess.user.sav_sec = (byte)atoi(line);
-}
-
-static void user_edit_width(void)
-{
-    char line[16];
-
-    data_prompt_line("Display width? ", line, sizeof(line));
-    if (line[0])
-        g_sess.user.width = (byte)atoi(line);
-}
-
-static void user_edit_length(void)
-{
-    char line[16];
-
-    data_prompt_line("Page length? ", line, sizeof(line));
-    if (line[0])
-        g_sess.user.length = (byte)atoi(line);
-}
-
-static void user_edit_nuls(void)
-{
-    char line[16];
-
-    data_prompt_line("Required NULS? ", line, sizeof(line));
-    if (line[0])
-        g_sess.user.nuls = (byte)atoi(line);
-}
-
-static void user_edit_linefeeds(void)
-{
-    g_sess.user.linefeed = data_yesno("Linefeeds (Y/N)? ", 0) ? 1 : 0;
-}
-
-static void user_edit_expert(void)
-{
-    g_sess.user.expert = data_yesno("Expert menus (Y/N)? ", 0) ? 1 : 0;
-    g_sess.expert = g_sess.user.expert ? 1 : 0;
-}
-
-static void user_edit_cls_codes(void)
-{
-    char line[32];
-    int a, b, c;
-
-    data_prompt_line("CLS codes (a,b,c)? ", line, sizeof(line));
-    if (sscanf(line, "%d,%d,%d", &a, &b, &c) == 3)
+    for (i = 0; i < NUM_SECT; i++)
     {
-        g_sess.user.cls[0] = (byte)a;
-        g_sess.user.cls[1] = (byte)b;
-        g_sess.user.cls[2] = (byte)c;
-    }
-}
-
-static void user_edit_bs_codes(void)
-{
-    char line[32];
-    int a, b, c;
-
-    data_prompt_line("BS codes (a,b,c)? ", line, sizeof(line));
-    if (sscanf(line, "%d,%d,%d", &a, &b, &c) == 3)
-    {
-        g_sess.user.bs[0] = (byte)a;
-        g_sess.user.bs[1] = (byte)b;
-        g_sess.user.bs[2] = (byte)c;
-    }
-}
-
-static void show_user_editor_menu(void)
-{
-    puts("");
-    puts("View/Edit your user options:");
-    puts("A: Name");
-    puts("B: Location");
-    puts("C: Phone number");
-    puts("D: Password");
-    puts("E: Terminal type");
-    puts("F: Protocol");
-    puts("G: Menu set");
-    puts("H: Saved section");
-    puts("I: Display width");
-    puts("J: Page length");
-    puts("K: NULS");
-    puts("L: Linefeeds");
-    puts("M: Expert menus");
-    puts("N: CLS codes");
-    puts("O: BS codes");
-    puts("Q: Quit");
-    puts("");
-}
-
-void do_user_edit(void)
-{
-    char line[16];
-    int done = 0;
-
-    while (!done)
-    {
-        show_user_editor_menu();
-        data_prompt_line("Option? ", line, sizeof(line));
-
-        if (line[0] >= 'a' && line[0] <= 'z')
-            line[0] -= 32;
-
-        switch (line[0])
-        {
-            case 'A': user_edit_name(); break;
-            case 'B': user_edit_location(); break;
-            case 'C': user_edit_phone(); break;
-            case 'D': user_edit_password(); break;
-            case 'E': user_edit_terminal(); break;
-            case 'F': user_edit_protocol(); break;
-            case 'G': user_edit_menu_set(); break;
-            case 'H': user_edit_saved_section(); break;
-            case 'I': user_edit_width(); break;
-            case 'J': user_edit_length(); break;
-            case 'K': user_edit_nuls(); break;
-            case 'L': user_edit_linefeeds(); break;
-            case 'M': user_edit_expert(); break;
-            case 'N': user_edit_cls_codes(); break;
-            case 'O': user_edit_bs_codes(); break;
-            case 'Q': done = 1; break;
-            default:  break;
-        }
+        u->rd_acc |= g_cfg.rd_acc[i];
+        u->wr_acc |= g_cfg.wr_acc[i];
+        u->up_acc |= g_cfg.up_acc[i];
+        u->dn_acc |= g_cfg.dn_acc[i];
     }
 
-    save_current_user();
+    if (u->protocol > 6)
+        u->protocol = 0;
+
+    if (u->menu_set >= NUM_MENUSET)
+        u->menu_set = 0;
 }
 
 /* ------------------------------------------------------------ */
-/* caller log display                                           */
+/* local helpers                                                */
 /* ------------------------------------------------------------ */
 
-void do_print_caller_log(void)
+static int user_is_blank(u)
+USRDESC *u;
 {
-    USRLOG logrec;
-    long recno;
+    if (!u)
+        return 1;
 
-    if (!g_fp_caller)
-    {
-        puts("Caller log not open");
-        bbs_pause();
+    return (u->name[0] == 0);
+}
+
+static void user_apply_runtime_sanity(u)
+USRDESC *u;
+{
+    if (!u)
         return;
-    }
 
-    puts("");
-    puts("Recent callers:");
-    puts("");
+    if (u->protocol > 6)
+        u->protocol = 0;
 
-    recno = data_first_caller(&logrec);
-    while (recno >= 0L)
-    {
-        printf("%6ld  %-24s  %-24s  %5d\n",
-            (long)logrec.number,
-            logrec.name,
-            logrec.loc,
-            (int)logrec.baud);
-
-        recno = data_next_caller(recno, &logrec);
-    }
-
-    bbs_pause();
+    if (u->menu_set >= NUM_MENUSET)
+        u->menu_set = 0;
 }
 
-/* ------------------------------------------------------------ */
-/* simple helpers for future maintenance module                 */
-/* ------------------------------------------------------------ */
+static void user_copy_name(dst, src, maxlen)
+char *dst;
+char *src;
+int maxlen;
+{
+    if (!dst || maxlen <= 0)
+        return;
 
-long user_find_by_name(name, u)
+    if (!src)
+        src = "";
+
+    strncpy(dst, src, maxlen);
+    dst[maxlen] = 0;
+}
+
+static int user_prompt_name(prompt, out, outlen)
+char *prompt;
+char *out;
+int outlen;
+{
+    term_getline(prompt, out, outlen);
+    data_trim_crlf(out);
+    return out[0] ? 1 : 0;
+}
+
+static int user_prompt_password(prompt, out, outlen)
+char *prompt;
+char *out;
+int outlen;
+{
+    term_getline_hidden(prompt, out, outlen);
+    data_trim_crlf(out);
+    return out[0] ? 1 : 0;
+}
+
+static void user_prompt_city(prompt, out, outlen)
+char *prompt;
+char *out;
+int outlen;
+{
+    term_getline(prompt, out, outlen);
+    data_trim_crlf(out);
+}
+
+static int user_find_recno_by_name(name, out)
 char *name;
+USRDESC *out;
+{
+    return data_find_user_by_name(name, out) >= 0L;
+}
+
+static long user_find_recno(name, out)
+char *name;
+USRDESC *out;
+{
+    return data_find_user_by_name(name, out);
+}
+
+static int user_write_at(recno, u)
+long recno;
 USRDESC *u;
 {
-    return data_find_user_by_name(name, u);
+    user_apply_runtime_sanity(u);
+    return data_write_user(recno, u);
 }
+
+static int user_can_edit_target(u)
+USRDESC *u;
+{
+    if (!u)
+        return 0;
+
+    if (u->name[0] == 0)
+        return 0;
+
+    return 1;
+}
+
+static void user_show_summary(u)
+USRDESC *u;
+{
+    char d[32], t[32];
+
+    if (!u)
+        return;
+
+    data_unpack_date(u->lastdate, d);
+    data_unpack_time(u->lasttime, t);
+
+    printf("Name      : %s\n", u->name);
+    printf("City      : %s\n", u->city);
+    printf("Seclevel  : %u\n", (unsigned)u->seclevel);
+    printf("Calls     : %u\n", (unsigned)u->calls);
+    printf("Uploads   : %u\n", (unsigned)u->uploads);
+    printf("Downloads : %u\n", (unsigned)u->downloads);
+    printf("High read : %ld\n", u->highmsgread);
+    printf("Last call : %s %s\n", d, t);
+    printf("Menu set  : %u\n", (unsigned)u->menu_set);
+    printf("Protocol  : %u\n", (unsigned)u->protocol);
+    printf("Expert    : %s\n", u->expert ? "Yes" : "No");
+    printf("Ratio     : %u\n", (unsigned)u->dnldratio);
+}
+
+static int user_prompt_edit_numeric(prompt, current)
+char *prompt;
+int current;
+{
+    char line[32];
+
+    term_getline(prompt, line, sizeof(line));
+    data_trim_crlf(line);
+
+    if (!line[0])
+        return current;
+
+    return atoi(line);
+}
+
+static void user_edit_fields(u)
+USRDESC *u;
+{
+    char line[128];
+
+    if (!u)
+        return;
+
+    printf("Editing user: %s\n", u->name);
+
+    term_getline("New city (blank = keep): ", line, sizeof(line));
+    data_trim_crlf(line);
+    if (line[0])
+        user_copy_name(u->city, line, CITY_LEN);
+
+    term_getline_hidden("New password (blank = keep): ", line, sizeof(line));
+    data_trim_crlf(line);
+    if (line[0])
+        user_copy_name(u->pwd, line, PWD_LEN);
+
+    u->seclevel =
+        (byte)user_prompt_edit_numeric("New seclevel (blank = keep): ",
+                                       (int)u->seclevel);
+
+    u->menu_set =
+        (byte)user_prompt_edit_numeric("New menu set (blank = keep): ",
+                                       (int)u->menu_set);
+
+    u->protocol =
+        (byte)user_prompt_edit_numeric("New protocol (blank = keep): ",
+                                       (int)u->protocol);
+
+    u->dnldratio =
+        (byte)user_prompt_edit_numeric("New ratio (blank = keep): ",
+                                       (int)u->dnldratio);
+
+    u->time_limit =
+        (ushort)user_prompt_edit_numeric("New time limit (blank = keep): ",
+                                         (int)u->time_limit);
+
+    u->expert =
+        (byte)user_prompt_edit_numeric("Expert 0/1 (blank = keep): ",
+                                       (int)u->expert);
+
+    user_apply_runtime_sanity(u);
+}
+
+static void user_make_printable_line(out, u)
+char *out;
+USRDESC *u;
+{
+    sprintf(out, "%-35s %-24s Sec:%-3u Calls:%-5u",
+            u->name,
+            u->city,
+            (unsigned)u->seclevel,
+            (unsigned)u->calls);
+}
+
+/* ------------------------------------------------------------ */
+/* public user helpers                                          */
+/* ------------------------------------------------------------ */
 
 int user_load_by_name(name, u)
 char *name;
 USRDESC *u;
 {
+    if (!name || !u)
+        return 0;
+
     return (data_find_user_by_name(name, u) >= 0L);
 }
 
 int user_save_current(void)
 {
     long recno;
+    USRDESC tmp;
 
-    recno = find_current_user_recno();
+    if (!g_sess.user.name[0])
+        return 0;
+
+    recno = user_find_recno(g_sess.user.name, &tmp);
     if (recno < 0L)
         return 0;
 
-    return data_write_user(recno, &g_sess.user);
+    return user_write_at(recno, &g_sess.user);
+}
+
+/* ------------------------------------------------------------ */
+/* maintenance actions                                          */
+/* ------------------------------------------------------------ */
+
+void do_add_user(void)
+{
+    USRDESC u;
+    char name[NAME_LEN + 4];
+    char pwd[PWD_LEN + 4];
+    long recno;
+
+    if (!sysop_password_prompt())
+        return;
+
+    if (!user_prompt_name("Add user name: ", name, sizeof(name)))
+        return;
+
+    if (user_find_recno_by_name(name, (USRDESC *)0))
+    {
+        puts("User already exists");
+        return;
+    }
+
+    user_apply_newuser_defaults(&u);
+    user_copy_name(u.name, name, NAME_LEN);
+
+    if (user_prompt_password("Password: ", pwd, sizeof(pwd)))
+        user_copy_name(u.pwd, pwd, PWD_LEN);
+
+    user_prompt_city("City: ", u.city, sizeof(u.city));
+
+    u.lastdate = 0;
+    u.lasttime = 0;
+    u.calls = 0;
+    u.uploads = 0;
+    u.downloads = 0;
+    u.highmsgread = 0L;
+
+    recno = data_find_blank_user();
+    if (recno < 0L)
+        recno = data_user_count();
+
+    if (!user_write_at(recno, &u))
+    {
+        puts("Unable to add user");
+        return;
+    }
+
+    puts("User added");
+}
+
+void do_delete_user(void)
+{
+    char name[NAME_LEN + 4];
+    USRDESC u;
+    long recno;
+
+    if (!sysop_password_prompt())
+        return;
+
+    if (!user_prompt_name("Delete user name: ", name, sizeof(name)))
+        return;
+
+    recno = user_find_recno(name, &u);
+    if (recno < 0L)
+    {
+        puts("User not found");
+        return;
+    }
+
+    user_zero(&u);
+
+    if (!user_write_at(recno, &u))
+    {
+        puts("Delete failed");
+        return;
+    }
+
+    puts("User deleted");
+}
+
+void do_change_user(void)
+{
+    char name[NAME_LEN + 4];
+    USRDESC u;
+    long recno;
+
+    if (!sysop_password_prompt())
+        return;
+
+    if (!user_prompt_name("Change user name: ", name, sizeof(name)))
+        return;
+
+    recno = user_find_recno(name, &u);
+    if (recno < 0L)
+    {
+        puts("User not found");
+        return;
+    }
+
+    if (!user_can_edit_target(&u))
+    {
+        puts("User cannot be edited");
+        return;
+    }
+
+    user_show_summary(&u);
+    puts("");
+
+    user_edit_fields(&u);
+
+    if (!user_write_at(recno, &u))
+    {
+        puts("Update failed");
+        return;
+    }
+
+    puts("User updated");
+}
+
+void do_purge_inactive_users(void)
+{
+    long i, n;
+    USRDESC u;
+    int purged;
+
+    if (!sysop_password_prompt())
+        return;
+
+    n = data_user_count();
+    purged = 0;
+
+    for (i = 0L; i < n; i++)
+    {
+        if (!data_read_user(i, &u))
+            continue;
+
+        if (user_is_blank(&u))
+            continue;
+
+        if (u.seclevel == 0)
+        {
+            user_zero(&u);
+            if (data_write_user(i, &u))
+                purged++;
+        }
+    }
+
+    printf("%d locked-out user(s) purged\n", purged);
+}
+
+void do_print_user_list(void)
+{
+    long i, n;
+    USRDESC u;
+    char line[128];
+
+    n = data_user_count();
+    if (n <= 0L)
+    {
+        puts("No users");
+        return;
+    }
+
+    for (i = 0L; i < n; i++)
+    {
+        if (!data_read_user(i, &u))
+            continue;
+        if (user_is_blank(&u))
+            continue;
+
+        user_make_printable_line(line, &u);
+        puts(line);
+    }
+}
+
+void do_update_user_defaults(void)
+{
+    puts("User defaults editor not yet expanded");
+}
+
+void do_user_edit(void)
+{
+    if (!g_sess.user.name[0])
+    {
+        puts("No active user");
+        return;
+    }
+
+    user_show_summary(&g_sess.user);
+}
+
+void do_user_statistics(void)
+{
+    long n;
+    long active;
+    long locked;
+    long i;
+    USRDESC u;
+
+    n = data_user_count();
+    active = 0L;
+    locked = 0L;
+
+    for (i = 0L; i < n; i++)
+    {
+        if (!data_read_user(i, &u))
+            continue;
+        if (user_is_blank(&u))
+            continue;
+
+        active++;
+        if (u.seclevel == 0)
+            locked++;
+    }
+
+    printf("Total records : %ld\n", n);
+    printf("Active users  : %ld\n", active);
+    printf("Locked users  : %ld\n", locked);
 }

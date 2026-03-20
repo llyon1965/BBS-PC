@@ -1,5 +1,7 @@
 /* BBSMENU.C
  *
+ * BBS-PC ! 4.21
+ *
  * Tightened compiled .MEN loader/executor
  *
  * Supports:
@@ -7,7 +9,17 @@
  * - fallback interim text format
  * - IRET records
  * - chained menu commands
- * - Function 102 / 103 return semantics tied to menu stack
+ * - stack-based menu navigation
+ *
+ * Tightened:
+ * - privilege checks use seclevel
+ * - access_mode / section_mask enforced correctly
+ * - access_mode 7 prompts for sysop password only at execution time
+ * - execution is blocked even if a hidden key is typed directly
+ * - return/goto helpers are explicitly stack-based
+ * - GOTO MENU truly replaces the current menu, including from MAIN
+ * - RETURN TOP unwinds to the base menu
+ * - popped/replaced menu frames are cleared so nested menus do not leak state
  */
 
 #include <stdio.h>
@@ -18,9 +30,53 @@
 #include "bbsdata.h"
 #include "bbsfunc.h"
 
-#define MEN_MAX_LINES   64
-#define MEN_HDR_SIZE    46
-#define MEN_REC_SIZE    22
+#ifndef BBSFUNC_INCLUDED
+#error "BBSMENU.C requires BBSFUNC.H to be included"
+#endif
+
+/* ------------------------------------------------------------ */
+/* Opcode sanity checks                                         */
+/* ------------------------------------------------------------ */
+
+#if MF_READ_MSGS != 11
+#error "Opcode mismatch: MF_READ_MSGS must be 11"
+#endif
+
+#if MF_READ_EMAIL != 12
+#error "Opcode mismatch: MF_READ_EMAIL must be 12"
+#endif
+
+#if MF_SCAN_MSGS != 13
+#error "Opcode mismatch: MF_SCAN_MSGS must be 13"
+#endif
+
+#if MF_EXIT_SYS != 100
+#error "Opcode mismatch: MF_EXIT_SYS must be 100"
+#endif
+
+#if MF_SHOW_MENU != 101
+#error "Opcode mismatch: MF_SHOW_MENU must be 101"
+#endif
+
+#if MF_RET_LEVELS != 102
+#error "Opcode mismatch: MF_RET_LEVELS must be 102"
+#endif
+
+#if MF_RET_TOP != 103
+#error "Opcode mismatch: MF_RET_TOP must be 103"
+#endif
+
+#if MF_CALL_MENU != 104
+#error "Opcode mismatch: MF_CALL_MENU must be 104"
+#endif
+
+#if MF_GOTO_MENU != 105
+#error "Opcode mismatch: MF_GOTO_MENU must be 105"
+#endif
+
+#if MF_EXEC_EXT != 111
+#error "Opcode mismatch: MF_EXEC_EXT must be 111"
+#endif
 
 typedef struct {
     ushort total_lines;
@@ -43,6 +99,10 @@ typedef struct {
     ushort section_mask;
     char   parm[13];
 } MENREC;
+
+#define MEN_MAX_LINES   64
+#define MEN_HDR_SIZE    46
+#define MEN_REC_SIZE    22
 
 /* ------------------------------------------------------------ */
 
@@ -97,6 +157,29 @@ long pos;
     memcpy(s, buf + pos, len);
     s[len] = 0;
     return s;
+}
+
+/* ------------------------------------------------------------ */
+/* menu frame helpers                                           */
+/* ------------------------------------------------------------ */
+
+static void menu_clear_slot(idx)
+int idx;
+{
+    if (idx < 0 || idx >= MAX_MENU_STACK)
+        return;
+
+    memset(&g_sess.mstack.menu[idx], 0, sizeof(MENUFILE));
+}
+
+static void menu_clear_slots_from(idx)
+int idx;
+{
+    while (idx < MAX_MENU_STACK)
+    {
+        menu_clear_slot(idx);
+        idx++;
+    }
 }
 
 /* ------------------------------------------------------------ */
@@ -284,7 +367,7 @@ MENUFILE *m;
             strncpy(it->text, strings[si], sizeof(it->text) - 1);
 
         it->in_use = 1;
-        it->rec_type = MEN_TYPE_TITLE;
+        it->rec_type = 0;
         it->is_iret = 0;
 
         m->item_count++;
@@ -303,7 +386,7 @@ MENUFILE *m;
         it = &m->item[m->item_count];
         memset(it, 0, sizeof(*it));
 
-        if (r.type == MEN_TYPE_TITLE)
+        if (r.type == 0)
             it->key = 0;
         else
             it->key = (char)r.key;
@@ -323,7 +406,7 @@ MENUFILE *m;
 
         it->in_use = 1;
         it->rec_type = r.type;
-        it->is_iret = (r.type == MEN_TYPE_IRET) ? 1 : 0;
+        it->is_iret = (r.type == 2) ? 1 : 0;
         it->boost = r.boost;
         it->section_mask = r.section_mask;
 
@@ -406,7 +489,7 @@ MENUFILE *m;
                 strncpy(it->text, part[1], sizeof(it->text) - 1);
 
             it->in_use = 1;
-            it->rec_type = MEN_TYPE_TITLE;
+            it->rec_type = 0;
             it->is_iret = 0;
 
             m->item_count++;
@@ -430,7 +513,7 @@ MENUFILE *m;
                     strncpy(it->parm, part[6], sizeof(it->parm) - 1);
 
                 it->in_use = 1;
-                it->rec_type = !stricmp(part[0], "IRET") ? MEN_TYPE_IRET : MEN_TYPE_ITEM;
+                it->rec_type = !stricmp(part[0], "IRET") ? 2 : 1;
                 it->is_iret = !stricmp(part[0], "IRET") ? 1 : 0;
 
                 m->item_count++;
@@ -469,11 +552,13 @@ char *fname;
 
     if (g_sess.mstack.sp >= MAX_MENU_STACK)
     {
-        puts("%% Menu stack overflow %%");
+        puts("% Menu stack overflow %");
         return 0;
     }
 
     m = &g_sess.mstack.menu[g_sess.mstack.sp];
+    menu_clear_slot(g_sess.mstack.sp);
+
     if (!menu_load(fname, m))
         return 0;
 
@@ -488,13 +573,176 @@ int menu_pop(void)
         return 0;
 
     g_sess.mstack.sp--;
-    node_mark_menu(g_sess.mstack.menu[g_sess.mstack.sp - 1].filename);
+    menu_clear_slot(g_sess.mstack.sp);
+
+    if (g_sess.mstack.sp > 0)
+        node_mark_menu(g_sess.mstack.menu[g_sess.mstack.sp - 1].filename);
+
     return 1;
+}
+
+/* ------------------------------------------------------------ */
+/* explicit stack helpers                                       */
+/* ------------------------------------------------------------ */
+
+static int menu_replace_current(fname)
+char *fname;
+{
+    MENUFILE m;
+
+    if (g_sess.mstack.sp <= 0)
+        return menu_push(fname);
+
+    memset(&m, 0, sizeof(m));
+    if (!menu_load(fname, &m))
+        return 0;
+
+    g_sess.mstack.menu[g_sess.mstack.sp - 1] = m;
+    node_mark_menu(fname);
+    return 1;
+}
+
+static void menu_return_top_level_stack(void)
+{
+    if (g_sess.mstack.sp <= 0)
+        return;
+
+    menu_clear_slots_from(1);
+    g_sess.mstack.sp = 1;
+    node_mark_menu(g_sess.mstack.menu[0].filename);
+}
+
+void do_return_specified_levels(void)
+{
+    if (!menu_pop())
+        return;
+}
+
+void do_return_top_level(void)
+{
+    menu_return_top_level_stack();
 }
 
 /* ------------------------------------------------------------ */
 /* display/access helpers                                       */
 /* ------------------------------------------------------------ */
+
+static bits menu_all_sections_mask(void)
+{
+    return (bits)0xFFFFU;
+}
+
+static bits menu_item_mask(it)
+MENUITEM *it;
+{
+    if (!it)
+        return 0;
+
+    if (it->section_mask == 0)
+        return menu_all_sections_mask();
+
+    return it->section_mask;
+}
+
+static int menu_privilege_allows(it)
+MENUITEM *it;
+{
+    int p;
+
+    if (!it)
+        return 0;
+
+    p = (int)g_sess.user.seclevel;
+
+    if (it->has_lo && p < it->priv_lo)
+        return 0;
+    if (it->has_hi && p > it->priv_hi)
+        return 0;
+
+    return 1;
+}
+
+static bits menu_visible_mask_for_mode(mode)
+int mode;
+{
+    switch (mode)
+    {
+        case 0:
+            return (g_sess.user.rd_acc |
+                    g_sess.user.wr_acc |
+                    g_sess.user.up_acc |
+                    g_sess.user.dn_acc |
+                    g_sess.user.sys_acc);
+
+        case 1:
+            return ((g_sess.user.rd_acc |
+                     g_sess.user.wr_acc |
+                     g_sess.user.up_acc |
+                     g_sess.user.dn_acc |
+                     g_sess.user.sys_acc) & (~g_sess.user.sect_mask));
+
+        case 2:
+            return (g_sess.user.rd_acc & (~g_sess.user.sect_mask));
+
+        case 3:
+            return (g_sess.user.wr_acc & (~g_sess.user.sect_mask));
+
+        case 4:
+            return (g_sess.user.dn_acc & (~g_sess.user.sect_mask));
+
+        case 5:
+            return (g_sess.user.up_acc & (~g_sess.user.sect_mask));
+
+        case 6:
+            return menu_all_sections_mask();
+
+        case 7:
+            return g_sess.user.sys_acc;
+
+        default:
+            return 0;
+    }
+}
+
+static int menu_access_visible(it)
+MENUITEM *it;
+{
+    bits mask;
+    bits visible;
+
+    if (!it)
+        return 0;
+
+    mask = menu_item_mask(it);
+    visible = menu_visible_mask_for_mode(it->access_mode);
+
+    return ((visible & mask) != 0);
+}
+
+static int menu_access_execute(it)
+MENUITEM *it;
+{
+    bits mask;
+
+    if (!it)
+        return 0;
+
+    mask = menu_item_mask(it);
+
+    switch (it->access_mode)
+    {
+        case 6:
+            return 1;
+
+        case 7:
+            if ((g_sess.user.sys_acc & mask) == 0)
+                return 0;
+            return sysop_password_prompt();
+
+        default:
+            return menu_access_visible(it);
+    }
+}
 
 static int item_visible(m, idx)
 MENUFILE *m;
@@ -506,15 +754,13 @@ int idx;
     if (!it->in_use)
         return 1;
 
-    if (it->rec_type == MEN_TYPE_TITLE)
+    if (it->rec_type == 0)
         return 1;
 
-    if (it->has_lo && g_sess.user.priv < it->priv_lo)
-        return 0;
-    if (it->has_hi && g_sess.user.priv > it->priv_hi)
+    if (!menu_privilege_allows(it))
         return 0;
 
-    return 1;
+    return menu_access_visible(it);
 }
 
 void menu_display(m)
@@ -574,21 +820,19 @@ MENUITEM *it;
     if (!it || !it->boost)
         return;
 
-    g_sess.user.priv = it->boost;
+    g_sess.user.seclevel = it->boost;
     user_save_current();
 }
 
 static int do_return_levels_from_item(it)
 MENUITEM *it;
 {
-    int levels, i;
+    int levels;
+    int i;
 
     levels = atoi(it->parm);
     if (levels <= 0)
-    {
-        do_return_specified_levels();
-        return 1;
-    }
+        levels = 1;
 
     for (i = 0; i < levels; i++)
     {
@@ -602,7 +846,7 @@ MENUITEM *it;
 static int execute_chain(chain)
 char *chain;
 {
-    char local[32];
+    char local[128];
     char *p;
 
     if (!chain || !*chain)
@@ -639,6 +883,18 @@ int idx;
 
     it = &m->item[idx];
 
+    if (!menu_privilege_allows(it))
+    {
+        puts("Access denied");
+        return 1;
+    }
+
+    if (!menu_access_execute(it))
+    {
+        puts("Access denied");
+        return 1;
+    }
+
     switch (it->function)
     {
         case MF_EXIT_SYS:
@@ -662,8 +918,7 @@ int idx;
             break;
 
         case MF_GOTO_MENU:
-            menu_pop();
-            if (!menu_push(it->parm))
+            if (!menu_replace_current(it->parm))
                 puts("Can't goto menu");
             break;
 
@@ -741,12 +996,24 @@ int idx;
             do_read_messages();
             break;
 
+        case MF_READ_NEW_MSGS:
+            do_read_new_messages();
+            break;
+
         case MF_READ_EMAIL:
             do_read_email();
             break;
 
+        case MF_READ_NEW_EMAIL:
+            do_read_new_email();
+            break;
+
         case MF_SCAN_MSGS:
             do_scan_messages();
+            break;
+
+        case MF_SCAN_NEW_MSGS:
+            do_scan_new_messages();
             break;
 
         case MF_DELETE_MSG:

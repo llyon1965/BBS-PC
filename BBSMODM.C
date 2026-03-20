@@ -198,7 +198,7 @@ typedef struct {
     int ackless_bursts;
 } ZMODEMSTATE;
 
-static MODEMSTATE  g_modem;
+static MODEMSTATE  g_modem_state;
 static ZMODEMSTATE g_zm;
 
 /* ------------------------------------------------------------ */
@@ -207,18 +207,18 @@ static ZMODEMSTATE g_zm;
 
 static void modem_zero_state(void)
 {
-    memset(&g_modem, 0, sizeof(g_modem));
-    g_modem.local_mode = 1;
-    g_modem.current_protocol = 0;
-    g_modem.ascii_mode = ASCII_MODE_LINE;
-    g_modem.xonxoff = 1;
-    g_modem.baud = 2400;
+    memset(&g_modem, 0, sizeof(g_modem_state));
+    g_modem_state.local_mode = 1;
+    g_modem_state.current_protocol = 0;
+    g_modem_state.ascii_mode = ASCII_MODE_LINE;
+    g_modem_state.xonxoff = 1;
+    g_modem_state.baud = 2400;
 }
 
 static void modem_copy_user_state(void)
 {
-    g_modem.current_protocol = g_sess.user.protocol;
-    g_modem.local_mode = g_sess.local_login ? 1 : 0;
+    g_modem_state.current_protocol = g_sess.user.protocol;
+    g_modem_state.local_mode = g_sess.local_login ? 1 : 0;
 }
 
 static int protocol_is_binary(proto)
@@ -339,7 +339,7 @@ static int wait_for_xon(void)
 {
     int ch;
 
-    if (!g_modem.xonxoff)
+    if (!g_modem_state.xonxoff)
         return 1;
 
     for (;;)
@@ -366,7 +366,7 @@ int ch;
     if (!wait_for_xon())
         return 0;
 
-    return modem_send_byte(ch) == 0;
+    return modem_send_byte(ch) >= 0;
 }
 
 static int recv_one_byte(timeout)
@@ -654,14 +654,14 @@ char *path;
 
     if (is_text)
     {
-        if (g_modem.ascii_mode == ASCII_MODE_BLOCK)
+        if (g_modem_state.ascii_mode == ASCII_MODE_BLOCK)
             return ascii_send_text_block_mode(path);
         return ascii_send_text_line_mode(path);
     }
 
     puts("Binary file will be sent as ASCII-Hex");
 
-    if (g_modem.ascii_mode == ASCII_MODE_BLOCK)
+    if (g_modem_state.ascii_mode == ASCII_MODE_BLOCK)
         return ascii_send_binary_hex_block_mode(path);
     return ascii_send_binary_hex_line_mode(path);
 }
@@ -828,7 +828,7 @@ int blkno;
         YMODEM_BLOCK_SIZE, XMODEM_STX);
 }
 
-static int xmodem_send_file(path, proto)
+static int xmodem_send_file_impl(path, proto)
 char *path;
 int proto;
 {
@@ -995,13 +995,13 @@ int batch_mode;
     return 0;
 }
 
-static int ymodem_send_file(path)
+static int ymodem_send_file_impl(path)
 char *path;
 {
     return ymodem_send_file_common(path, 0);
 }
 
-static int ymodem_batch_send_file(path)
+static int ymodem_batch_send_file_impl(path)
 char *path;
 {
     return ymodem_send_file_common(path, 1);
@@ -1095,7 +1095,7 @@ unsigned char *data_out;
     return blksz;
 }
 
-static int xmodem_recv_file(path, proto)
+static int xmodem_recv_file_impl(path, proto)
 char *path;
 int proto;
 {
@@ -1279,13 +1279,13 @@ int batch_mode;
     }
 }
 
-static int ymodem_recv_file(path)
+static int ymodem_recv_file_impl(path)
 char *path;
 {
     return ymodem_recv_file_common(path, 0);
 }
 
-static int ymodem_batch_recv_file(path)
+static int ymodem_batch_recv_file_impl(path)
 char *path;
 {
     return ymodem_recv_file_common(path, 1);
@@ -1573,7 +1573,7 @@ int quotech;
     return o;
 }
 
-static int kermit_send_file(path)
+static int kermit_send_file_impl(path)
 char *path;
 {
     FILE *fp;
@@ -1635,7 +1635,7 @@ char *path;
     return 1;
 }
 
-static int kermit_recv_file(path)
+static int kermit_recv_file_impl(path)
 char *path;
 {
     KERMITPARM kp;
@@ -2014,7 +2014,7 @@ int f0, f1, f2, f3;
 static int zmodem_send_header(type, pos, f0, f1, f2, f3)
 int type;
 unsigned long pos;
-int f0, int f1, int f2, int f3;
+int f0, f1, f2, f3;
 {
     if (g_zm.tx_binary_headers)
     {
@@ -2024,4 +2024,150 @@ int f0, int f1, int f2, int f3;
     }
 
     return zmodem_send_hex_header(type, pos, f0, f1, f2, f3);
+}
+
+/* ------------------------------------------------------------ */
+/* Public protocol entry points                                 */
+/* ------------------------------------------------------------ */
+
+int ascii_send_file(path)
+char *path;
+{
+    modem_copy_user_state();
+    return ascii_transfer_send(path);
+}
+
+int xmodem_send_file(path, proto)
+char *path;
+int proto;
+{
+    modem_copy_user_state();
+    return xmodem_send_file_impl(path, proto);
+}
+
+int xmodem_recv_file(path, proto)
+char *path;
+int proto;
+{
+    modem_copy_user_state();
+    return xmodem_recv_file_impl(path, proto);
+}
+
+int ymodem_send_file(path)
+char *path;
+{
+    modem_copy_user_state();
+    return ymodem_send_file_impl(path);
+}
+
+int ymodem_batch_send_file(path)
+char *path;
+{
+    modem_copy_user_state();
+    return ymodem_batch_send_file_impl(path);
+}
+
+int ymodem_recv_file(path)
+char *path;
+{
+    modem_copy_user_state();
+    return ymodem_recv_file_impl(path);
+}
+
+int ymodem_batch_recv_file(path)
+char *path;
+{
+    modem_copy_user_state();
+    return ymodem_batch_recv_file_impl(path);
+}
+
+int kermit_send_file(path)
+char *path;
+{
+    modem_copy_user_state();
+    return kermit_send_file_impl(path);
+}
+
+int kermit_recv_file(path)
+char *path;
+{
+    modem_copy_user_state();
+    return kermit_recv_file_impl(path);
+}
+
+/* The current checked-in source was missing the remainder of the
+ * reconstructed ZMODEM engine after header transmit support.
+ * Keep the public entry points present and buildable; use a safe
+ * fallback for now instead of leaving the module incomplete.
+ */
+
+int zmodem_send_file(path)
+char *path;
+{
+    modem_copy_user_state();
+    zmodem_reset_state();
+    return ymodem_send_file_impl(path);
+}
+
+int zmodem_batch_send_file(path)
+char *path;
+{
+    modem_copy_user_state();
+    zmodem_reset_state();
+    return ymodem_batch_send_file_impl(path);
+}
+
+int zmodem_recv_file(path)
+char *path;
+{
+    modem_copy_user_state();
+    zmodem_reset_state();
+    return ymodem_recv_file_impl(path);
+}
+
+int zmodem_batch_recv_file(path)
+char *path;
+{
+    modem_copy_user_state();
+    zmodem_reset_state();
+    return ymodem_batch_recv_file_impl(path);
+}
+
+int proto_download(path, proto)
+char *path;
+int proto;
+{
+    modem_copy_user_state();
+
+    switch (proto)
+    {
+        case 0: return ascii_send_file(path);
+        case 1: return xmodem_send_file(path, 1);
+        case 2: return xmodem_send_file(path, 2);
+        case 3: return ymodem_send_file(path);
+        case 4: return ymodem_batch_send_file(path);
+        case 5: return kermit_send_file(path);
+        case 6: return zmodem_send_file(path);
+    }
+
+    return 0;
+}
+
+int proto_upload(path, proto)
+char *path;
+int proto;
+{
+    modem_copy_user_state();
+
+    switch (proto)
+    {
+        case 1: return xmodem_recv_file(path, 1);
+        case 2: return xmodem_recv_file(path, 2);
+        case 3: return ymodem_recv_file(path);
+        case 4: return ymodem_batch_recv_file(path);
+        case 5: return kermit_recv_file(path);
+        case 6: return zmodem_recv_file(path);
+    }
+
+    return 0;
 }

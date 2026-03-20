@@ -2,32 +2,11 @@
  *
  * BBS-PC ! 4.21
  *
- * Reconstructed and modernised source
- * derived from BBS-PC 4.20
- *
  * Runtime entry / startup / shutdown / waiting-for-call loop
  *
- * Command-line switches:
- *   -C      Ignore COM/FOSSIL ports and run local-only
- *   -N:x    Select node number x (default = 1)
- *
- * Ownership in this module:
- * - overall runtime flow
- * - startup / shutdown
- * - waiting-for-call screen
- * - waiting loop and local sysop hotkey handling
- * - connection detection handoff into login
- * - active session loop
- * - local-only caller status bar
- * - command-line switch handling
- *
- * Notes:
- * - The waiting-for-call screen is the first screen shown on startup and
- *   the screen returned to after logout.
- * - During an active remote session, normal BBS output is mirrored through
- *   the normal runtime path, but the top caller status bar is drawn only
- *   on the local screen.
- * - Node number is stored internally as 0-based, but displayed as 1-based.
+ * Updated:
+ * - node drives COM selection
+ * - disconnect reasons are tracked for caller log accuracy
  */
 
 #include <stdio.h>
@@ -48,14 +27,41 @@
 #define WAIT_MENU_COUNT 6
 #endif
 
+#ifndef SYSOP_SECLEVEL_MEMBER
+#define SYSOP_SECLEVEL_MEMBER 10
+#endif
+
+#ifndef BBS_ENTER_WAIT_SECONDS
+#define BBS_ENTER_WAIT_SECONDS 60
+#endif
+
+#ifndef BBS_ENTER_POLL_MS
+#define BBS_ENTER_POLL_MS 100
+#endif
+
 static int g_running = 1;
 static int g_wait_menu_sel = 0;
 static int g_ignore_com = 0;
-static int g_selected_node = 0;     /* 0-based internally */
+static int g_requested_node = 1;
+
+static int  g_sysop_force_disconnect = 0;
+static int  g_sysop_force_chat = 0;
+static byte g_saved_seclevel = 0;
+static int  g_saved_seclevel_valid = 0;
 
 /* ------------------------------------------------------------ */
 /* local helpers                                                */
 /* ------------------------------------------------------------ */
+
+static void bbs_set_disconnect_reason(s)
+char *s;
+{
+    if (!s)
+        s = "";
+
+    strncpy(g_sess.disconnect_reason, s, DISC_REASON_LEN);
+    g_sess.disconnect_reason[DISC_REASON_LEN] = 0;
+}
 
 static void local_cls(void)
 {
@@ -141,7 +147,7 @@ char *argv[];
     char *p;
 
     g_ignore_com = 0;
-    g_selected_node = 0;
+    g_requested_node = 1;
 
     for (i = 1; i < argc; i++)
     {
@@ -160,7 +166,7 @@ char *argv[];
 
         if (*p == 'N' || *p == 'n')
         {
-            int n = 0;
+            int n = 1;
 
             p++;
             if (*p == ':')
@@ -169,13 +175,29 @@ char *argv[];
             n = atoi(p);
             if (n < 1)
                 n = 1;
-            if (n > 99)
-                n = 99;
+            if (n > 2)
+                n = 2;
 
-            g_selected_node = n - 1;
+            g_requested_node = n;
             continue;
         }
     }
+}
+
+static void bbs_apply_selected_node(void)
+{
+    if (g_requested_node < 1)
+        g_requested_node = 1;
+    if (g_requested_node > 2)
+        g_requested_node = 2;
+
+    g_sess.node = g_requested_node - 1;
+    g_cfg.node  = g_requested_node;
+}
+
+static int bbs_current_com_port(void)
+{
+    return g_sess.node + 1;
 }
 
 static void bbs_log_startup(void)
@@ -184,8 +206,7 @@ static void bbs_log_startup(void)
 
     data_now_strings(d, t);
     printf("[%s %s] %s startup (Node %d%s)\n",
-           d, t, BBS_VERSION, g_selected_node + 1,
-           g_ignore_com ? ", -C" : "");
+           d, t, BBS_VERSION, g_requested_node, g_ignore_com ? ", -C" : "");
 }
 
 static void bbs_log_shutdown(void)
@@ -194,7 +215,7 @@ static void bbs_log_shutdown(void)
 
     data_now_strings(d, t);
     printf("[%s %s] %s shutdown (Node %d)\n",
-           d, t, BBS_VERSION, g_selected_node + 1);
+           d, t, BBS_VERSION, g_requested_node);
 }
 
 static void bbs_apply_startup_defaults(void)
@@ -202,11 +223,45 @@ static void bbs_apply_startup_defaults(void)
     memset(&g_sess, 0, sizeof(g_sess));
     memset(&g_node, 0, sizeof(g_node));
 
-    g_sess.node = g_selected_node;
+    g_sess.node = 0;
     g_sess.local_login = 0;
     g_sess.logged_in = 0;
     g_sess.menu_set = 0;
     g_sess.expert = 0;
+    g_sess.logon_unix = 0L;
+    g_sess.last_activity_unix = 0L;
+    g_sess.base_minutes_allowed = 0;
+    g_sess.bonus_minutes = 0;
+    g_sess.ratio_off = 0;
+    g_sess.last_time_warning = -1;
+    g_sess.running = 1;
+    g_sess.mstack.sp = 0;
+    g_sess.caller_log_recno = -1L;
+    g_sess.caller_no = 0L;
+    g_sess.start_uploads = 0;
+    g_sess.start_downloads = 0;
+    g_sess.disconnect_reason[0] = 0;
+}
+
+static void bbs_reset_session_overrides(void)
+{
+    g_sysop_force_disconnect = 0;
+    g_sysop_force_chat = 0;
+    g_saved_seclevel = 0;
+    g_saved_seclevel_valid = 0;
+
+    g_sess.bonus_minutes = 0;
+    g_sess.ratio_off = 0;
+    g_sess.last_time_warning = -1;
+}
+
+static void bbs_capture_original_seclevel(void)
+{
+    if (!g_saved_seclevel_valid)
+    {
+        g_saved_seclevel = g_sess.user.seclevel;
+        g_saved_seclevel_valid = 1;
+    }
 }
 
 static char *bbs_wait_menu_text(idx)
@@ -258,14 +313,6 @@ char *out;
 static void bbs_wait_get_fossil_line2(out)
 char *out;
 {
-    int com_port;
-
-    com_port = g_sess.node + 1;
-    if (com_port < 1)
-        com_port = 1;
-    if (com_port > 2)
-        com_port = 2;
-
     if (g_ignore_com)
     {
         strcpy(out, "Port: Disabled   Carrier: N/A   Session: Local");
@@ -274,9 +321,11 @@ char *out;
 
     if (fossil_driver_installed())
         sprintf(out, "Port: COM%d   Carrier: %s   Session: Waiting",
-                com_port, fossil_carrier() ? "Present" : "Waiting");
+                bbs_current_com_port(),
+                fossil_carrier() ? "Present" : "Waiting");
     else
-        sprintf(out, "Port: COM%d   Carrier: N/A   Session: Waiting", com_port);
+        sprintf(out, "Port: COM%d   Carrier: N/A   Session: Waiting",
+                bbs_current_com_port());
 }
 
 static void bbs_wait_get_dir0_text(out, outlen)
@@ -337,7 +386,7 @@ int highlight;
 
     local_cls();
 
-    sprintf(title, "%s Node #%d", BBS_VERSION, g_sess.node + 1);
+    sprintf(title, "%s Node #%d", BBS_VERSION, g_requested_node);
 
     bbs_waiting_screen_update_stats();
 
@@ -355,7 +404,7 @@ int highlight;
     if (g_ignore_com)
         printf("Port: Disabled");
     else
-        printf("Port: COM%d", ((g_sess.node + 1) > 2) ? 2 : (g_sess.node + 1));
+        printf("Port: COM%d", bbs_current_com_port());
 
     fflush(stdout);
 }
@@ -388,12 +437,9 @@ static int bbs_wait_read_key(void)
 
         switch (ch)
         {
-            case 72:
-                return 'U';
-            case 80:
-                return 'D';
-            default:
-                return -1;
+            case 72: return 'U';
+            case 80: return 'D';
+            default: return -1;
         }
     }
 
@@ -406,9 +452,72 @@ static int bbs_wait_read_key(void)
     return ch;
 }
 
+static int bbs_session_key_available(void)
+{
+    return kbhit();
+}
+
+static int bbs_session_read_key(void)
+{
+    int ch;
+
+    ch = getch();
+
+    if (ch == 0 || ch == 0xE0)
+    {
+        ch = getch();
+
+        switch (ch)
+        {
+            case 59: return 1001;
+            case 60: return 1002;
+            case 61: return 1003;
+            case 62: return 1004;
+            case 63: return 1005;
+            default: return -1;
+        }
+    }
+
+    return ch;
+}
+
+static int bbs_wait_for_remote_enter(void)
+{
+    time_t start;
+    time_t now;
+    int ch;
+
+    puts("");
+    puts("Press [ENTER]");
+    puts("");
+
+    start = time((time_t *)0);
+    now = start;
+
+    while ((long)(now - start) < BBS_ENTER_WAIT_SECONDS)
+    {
+        if (!term_carrier())
+            return 0;
+
+        ch = modem_recv_byte(0);
+        if (ch >= 0)
+        {
+            if (ch == '\r' || ch == '\n')
+                return 1;
+        }
+
+        delay(BBS_ENTER_POLL_MS);
+        now = time((time_t *)0);
+    }
+
+    return 0;
+}
+
 static void bbs_waiting_screen_handle_local_key(key)
 int key;
 {
+    int ok;
+
     switch (key)
     {
         case 'U':
@@ -438,13 +547,9 @@ int key;
                     break;
 
                 case 2:
-                    if (login_local())
-                    {
-                        g_sess.logged_in = 1;
-                        term_apply_user(&g_sess.user);
-                        term_start_session();
-                        node_session_begin();
-                    }
+                    ok = login_local();
+                    if (bbs_session_ready_from_login(ok))
+                        return;
                     break;
 
                 case 3:
@@ -468,6 +573,70 @@ int key;
     }
 }
 
+static void bbs_handle_online_sysop_key(key)
+int key;
+{
+    switch (key)
+    {
+        case 1001:
+            g_sysop_force_chat = 1;
+            g_node.wantchat = 1;
+            node_set_chat(1);
+            do_chat_with_sysop();
+            g_sysop_force_chat = 0;
+            g_node.wantchat = 0;
+            node_set_chat(0);
+            session_touch_activity();
+            break;
+
+        case 1002:
+            bbs_set_disconnect_reason("<Sysop Disconnect>");
+            g_sysop_force_disconnect = 1;
+            break;
+
+        case 1003:
+            g_sess.bonus_minutes += 15;
+            break;
+
+        case 1004:
+            bbs_capture_original_seclevel();
+            g_sess.user.seclevel = SYSOP_SECLEVEL_MEMBER;
+            break;
+
+        case 1005:
+            g_sess.ratio_off = g_sess.ratio_off ? 0 : 1;
+            break;
+    }
+}
+
+static void bbs_send_time_warning(mins_left)
+int mins_left;
+{
+    puts("");
+    printf("*** Warning: %d minute%s remaining on this call. ***\n",
+           mins_left, (mins_left == 1) ? "" : "s");
+    puts("");
+}
+
+static void bbs_check_time_warning(void)
+{
+    int left;
+
+    if (g_sess.base_minutes_allowed <= 0)
+        return;
+
+    left = session_minutes_left();
+
+    if (left > 5 || left < 1)
+        return;
+
+    if (g_sess.last_time_warning == left)
+        return;
+
+    bbs_send_time_warning(left);
+    g_sess.last_time_warning = left;
+}
+
 static void bbs_clear_local_status_bar(void)
 {
     local_put_blank_line(1);
@@ -482,6 +651,9 @@ static void bbs_draw_local_status_bar(void)
     char name[NAME_LEN + 2];
     char location[40];
     char speed[16];
+    char pagebuf[8];
+    char ratiobuf[8];
+    char idlebuf[16];
 
     strncpy(name, g_sess.user.name, NAME_LEN + 1);
     name[NAME_LEN + 1] = 0;
@@ -493,6 +665,13 @@ static void bbs_draw_local_status_bar(void)
     location[sizeof(location) - 1] = 0;
 
     sprintf(speed, "%d", g_modem.baud > 0 ? g_modem.baud : 0);
+    strcpy(pagebuf, g_node.wantchat ? "Yes" : "No");
+    strcpy(ratiobuf, g_sess.ratio_off ? "Off" : "On ");
+
+    if (g_cfg.idle_limit > 0)
+        sprintf(idlebuf, "%d/%u", session_idle_minutes(), (unsigned)g_cfg.idle_limit);
+    else
+        strcpy(idlebuf, "Off");
 
     sprintf(line1,
         " %-18.18s %-16.16s Calls:%-4u Sec:%-3u Baud:%-6s ",
@@ -503,10 +682,13 @@ static void bbs_draw_local_status_bar(void)
         speed);
 
     sprintf(line2,
-        " Paged:%s Msgs left:%-4u Uploads:%-4u ",
-        g_sess.page_sysop ? "Yes" : "No ",
+        " Paged:%-3s Msgs:%-3u Ups:%-3u Bonus:%-3d Ratio:%-3s Idle:%-7s",
+        pagebuf,
         (unsigned)g_sess.msgs_left,
-        (unsigned)g_sess.uploads);
+        (unsigned)g_sess.uploads,
+        g_sess.bonus_minutes,
+        ratiobuf,
+        idlebuf);
 
     local_goto_xy(1, 1);
     printf("%-79s", line1);
@@ -526,7 +708,17 @@ int ok;
     if (!ok)
         return 0;
 
+    bbs_reset_session_overrides();
+
+    g_sess.logon_unix = (ulong)time((time_t *)0);
+    g_sess.last_activity_unix = g_sess.logon_unix;
+
+    if (g_sess.base_minutes_allowed < 0)
+        g_sess.base_minutes_allowed = 0;
+
     g_sess.logged_in = 1;
+    g_sess.running = 1;
+    g_sess.disconnect_reason[0] = 0;
     term_apply_user(&g_sess.user);
     term_start_session();
     node_session_begin();
@@ -562,6 +754,7 @@ char *argv[];
 {
     bbs_parse_args(argc, argv);
     bbs_apply_startup_defaults();
+    bbs_apply_selected_node();
     bbs_log_startup();
 
     if (!load_bbs_paths("BBSPATHS.CFG"))
@@ -575,6 +768,8 @@ char *argv[];
         puts("Unable to load CFGINFO.DAT");
         exit(1);
     }
+
+    g_cfg.node = g_requested_node;
 
     if (!open_main_datafiles())
     {
@@ -591,6 +786,7 @@ char *argv[];
     }
     else
     {
+        g_modem.port = bbs_current_com_port();
         modem_init();
     }
 
@@ -703,6 +899,14 @@ void bbs_waiting_for_call(void)
         if (bbs_check_for_incoming_call())
         {
             modem_begin_session();
+
+            if (!bbs_wait_for_remote_enter())
+            {
+                modem_end_session();
+                bbs_draw_waiting_screen(g_wait_menu_sel);
+                continue;
+            }
+
             login_ok = login_user();
 
             if (bbs_session_ready_from_login(login_ok))
@@ -738,6 +942,9 @@ void bbs_main_loop(void)
 void bbs_session_loop(void)
 {
     MENUFILE *m;
+    int key;
+
+    g_sess.mstack.sp = 0;
 
     if (!menu_push("MAIN"))
     {
@@ -749,6 +956,41 @@ void bbs_session_loop(void)
 
     while (g_sess.logged_in)
     {
+        if (bbs_session_key_available())
+        {
+            key = bbs_session_read_key();
+            bbs_handle_online_sysop_key(key);
+        }
+
+        if (!g_ignore_com && !term_carrier())
+        {
+            bbs_set_disconnect_reason("<Carrier Lost>");
+            g_sysop_force_disconnect = 1;
+            break;
+        }
+
+        bbs_check_time_warning();
+
+        if (session_idle_expired())
+        {
+            puts("");
+            puts("*** Disconnected due to inactivity ***");
+            puts("");
+            bbs_set_disconnect_reason("<Sleep Disconnect>");
+            g_sysop_force_disconnect = 1;
+            break;
+        }
+
+        if (session_time_expired())
+        {
+            bbs_set_disconnect_reason("<Time Limit>");
+            g_sysop_force_disconnect = 1;
+            break;
+        }
+
+        if (g_sysop_force_disconnect)
+            break;
+
         m = menu_current();
         if (!m)
             break;
@@ -757,7 +999,12 @@ void bbs_session_loop(void)
         menu_display(m);
         if (!menu_execute(m))
             break;
+
+        session_touch_activity();
     }
+
+    if (!g_sess.disconnect_reason[0] && !g_sysop_force_disconnect)
+        bbs_set_disconnect_reason("<Normal Logout>");
 }
 
 /* ------------------------------------------------------------ */
@@ -772,6 +1019,13 @@ void bbs_login_sequence(void)
         return;
 
     modem_begin_session();
+
+    if (!bbs_wait_for_remote_enter())
+    {
+        modem_end_session();
+        return;
+    }
+
     ok = login_user();
     (void)bbs_session_ready_from_login(ok);
 
@@ -784,6 +1038,12 @@ void bbs_logout_sequence(void)
     if (!g_sess.logged_in)
         return;
 
+    if (g_saved_seclevel_valid)
+        g_sess.user.seclevel = g_saved_seclevel;
+
+    if (session_time_expired() && !g_sess.disconnect_reason[0])
+        bbs_set_disconnect_reason("<Time Limit>");
+
     logout_user();
     node_session_end();
     term_end_session();
@@ -792,5 +1052,9 @@ void bbs_logout_sequence(void)
         modem_end_session();
 
     g_sess.logged_in = 0;
+    g_sess.logon_unix = 0L;
+    g_sess.last_activity_unix = 0L;
+    g_sess.mstack.sp = 0;
+    bbs_reset_session_overrides();
     bbs_clear_local_status_bar();
 }
