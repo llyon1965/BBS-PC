@@ -1,19 +1,24 @@
 /* BBSDATA.C
  *
- * BBS-PC ! 4.21
+ * BBS-PC! 4.21
  *
- * Reconstructed and modernised source
- * derived from BBS-PC 4.20
+ * Core data/config/path/file wrappers.
  *
- * Data/config/path helpers and runtime-facing wrappers around
- * the fixed-record ISAM layer.
+ * Ownership:
+ * - BBSPATHS.CFG loading
+ * - CFGINFO.DAT loading/saving
+ * - main datafile open/close
+ * - data_* wrappers over ISAM helpers
+ * - date/time helpers
+ * - path helpers
+ * - message text chain storage/load helpers
  */
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <time.h>
 #include <ctype.h>
+#include <time.h>
 
 #include "bbsdata.h"
 #include "bbsfunc.h"
@@ -28,27 +33,68 @@ BBSSESSION g_sess;
 NODEINFO   g_node;
 PARAMS     g_modem;
 
-FILE *g_usrfp = NULL;
-FILE *g_msgfp = NULL;
-FILE *g_txtfp = NULL;
-FILE *g_udfp  = NULL;
-FILE *g_logfp = NULL;
+FILE *g_usrfp = (FILE *)0;
+FILE *g_msgfp = (FILE *)0;
+FILE *g_txtfp = (FILE *)0;
+FILE *g_udfp  = (FILE *)0;
+FILE *g_logfp = (FILE *)0;
 
 /* ------------------------------------------------------------ */
 /* local helpers                                                */
 /* ------------------------------------------------------------ */
-
-static void data_zero_cfg(void)
-{
-    memset(&g_cfg, 0, sizeof(g_cfg));
-}
 
 static void data_zero_paths(void)
 {
     memset(&g_paths, 0, sizeof(g_paths));
 }
 
-static void data_trim_right(s)
+static void data_zero_cfg(void)
+{
+    int i;
+
+    memset(&g_cfg, 0, sizeof(g_cfg));
+
+    strcpy(g_cfg.bbsname, "BBS-PC!");
+    strcpy(g_cfg.sysopname, "SYSOP");
+    strcpy(g_cfg.sysop_pass, "");
+
+    g_cfg.node = 1;
+    g_cfg.min_baud = 300;
+    g_cfg.max_baud = 38400;
+    g_cfg.page_len = 24;
+    g_cfg.max_nodes = 2;
+
+    g_cfg.modem_baud = 2400;
+    g_cfg.modem_parity = 'N';
+    g_cfg.modem_data_bits = 8;
+    g_cfg.modem_stop_bits = 1;
+
+    g_cfg.limit[0] = 30;
+    g_cfg.limit[1] = 60;
+    g_cfg.priv[0] = 1;
+    g_cfg.priv[1] = 10;
+    g_cfg.idle_limit = 0;
+
+    for (i = 0; i < NUM_SECT; i++)
+    {
+        sprintf(g_cfg.sect_name[i], "Section %d", i);
+        g_cfg.rd_acc[i] = (bits)(1U << i);
+        g_cfg.wr_acc[i] = (bits)(1U << i);
+        g_cfg.up_acc[i] = (bits)(1U << i);
+        g_cfg.dn_acc[i] = (bits)(1U << i);
+    }
+
+    strcpy(g_cfg.term_name[0], "TTY");
+    strcpy(g_cfg.term_name[1], "ANSI");
+    strcpy(g_cfg.term_name[2], "AVATAR");
+    strcpy(g_cfg.term_name[3], "RIP");
+    strcpy(g_cfg.term_name[4], "VT52");
+    strcpy(g_cfg.term_name[5], "VT100");
+    strcpy(g_cfg.term_name[6], "PC8");
+    strcpy(g_cfg.term_name[7], "Custom");
+}
+
+static void data_trim_spaces(s)
 char *s;
 {
     int n;
@@ -56,119 +102,191 @@ char *s;
     if (!s)
         return;
 
+    while (*s == ' ' || *s == '\t')
+        memmove(s, s + 1, strlen(s));
+
     n = strlen(s);
-    while (n > 0)
+    while (n > 0 &&
+           (s[n - 1] == ' ' || s[n - 1] == '\t' ||
+            s[n - 1] == '\r' || s[n - 1] == '\n'))
     {
-        if (s[n - 1] == ' ' || s[n - 1] == '\t' ||
-            s[n - 1] == '\r' || s[n - 1] == '\n')
-        {
-            s[n - 1] = 0;
-            n--;
-        }
-        else
-            break;
+        s[n - 1] = 0;
+        n--;
     }
 }
 
-static void data_trim_left_inplace(s)
-char *s;
+static char *data_cfg_value(line)
+char *line;
 {
     char *p;
 
-    if (!s)
-        return;
+    p = strchr(line, '=');
+    if (!p)
+        return (char *)0;
 
-    p = s;
-    while (*p == ' ' || *p == '\t')
-        p++;
-
-    if (p != s)
-        memmove(s, p, strlen(p) + 1);
+    *p++ = 0;
+    data_trim_spaces(line);
+    data_trim_spaces(p);
+    return p;
 }
 
-static void data_trim_all(s)
-char *s;
+static void data_set_default_paths(void)
 {
-    data_trim_right(s);
-    data_trim_left_inplace(s);
+    int i;
+
+    if (!g_paths.msg_path[0]) strcpy(g_paths.msg_path, ".");
+    if (!g_paths.usr_path[0]) strcpy(g_paths.usr_path, ".");
+    if (!g_paths.ud_path[0])  strcpy(g_paths.ud_path,  ".");
+    if (!g_paths.log_path[0]) strcpy(g_paths.log_path, ".");
+
+    for (i = 0; i < NUM_SECT; i++)
+        if (!g_paths.updn_path[i][0])
+            strcpy(g_paths.updn_path[i], ".");
 }
 
-static int data_parse_kv_line(line, key, val)
-char *line;
-char *key;
-char *val;
-{
-    char *eq;
-
-    if (!line || !key || !val)
-        return 0;
-
-    eq = strchr(line, '=');
-    if (!eq)
-        return 0;
-
-    *eq = 0;
-    strcpy(key, line);
-    strcpy(val, eq + 1);
-
-    data_trim_all(key);
-    data_trim_all(val);
-    return 1;
-}
-
-static void data_fix_path_sep(path)
-char *path;
-{
-    while (*path)
-    {
-        if (*path == '/')
-            *path = '\\';
-        path++;
-    }
-}
-
-static void data_ensure_trailing_backslash(path)
-char *path;
+static void data_join_path(out, dir, name)
+char *out;
+char *dir;
+char *name;
 {
     int n;
 
-    if (!path || !path[0])
-        return;
-
-    n = strlen(path);
-    if (path[n - 1] != '\\' && path[n - 1] != '/')
+    if (!dir || !dir[0] || !strcmp(dir, "."))
     {
-        path[n] = '\\';
-        path[n + 1] = 0;
+        strcpy(out, name);
+        return;
     }
+
+    strcpy(out, dir);
+    n = strlen(out);
+    if (n > 0 && out[n - 1] != '\\' && out[n - 1] != '/')
+        strcat(out, "\\");
+    strcat(out, name);
 }
 
-static int data_open_one_file(fpp, path)
-FILE **fpp;
+static void data_make_user_path(out, name)
+char *out;
+char *name;
+{
+    data_join_path(out, g_paths.usr_path, name);
+}
+
+static void data_make_ud_path(out, name)
+char *out;
+char *name;
+{
+    data_join_path(out, g_paths.ud_path, name);
+}
+
+static void data_make_log_path(out, name)
+char *out;
+char *name;
+{
+    data_join_path(out, g_paths.log_path, name);
+}
+
+static int data_ensure_header_file(path)
 char *path;
 {
     FILE *fp;
+    char hdr[HDRLEN];
 
-    fp = isam_open(path, "r+b");
-    if (!fp)
+    fp = fopen(path, "r+b");
+    if (fp)
     {
-        fp = isam_open(path, "w+b");
-        if (!fp)
-            return 0;
-
-        if (!isam_blank_header(fp))
-        {
-            isam_close(fp);
-            return 0;
-        }
+        fclose(fp);
+        return 1;
     }
 
-    *fpp = fp;
+    fp = fopen(path, "w+b");
+    if (!fp)
+        return 0;
+
+    memset(hdr, 0, sizeof(hdr));
+    if (fwrite(hdr, sizeof(hdr), 1, fp) != 1)
+    {
+        fclose(fp);
+        return 0;
+    }
+
+    fclose(fp);
     return 1;
 }
 
+static void data_unpack_date_time_parts(packed, year, month, day)
+ushort packed;
+int *year;
+int *month;
+int *day;
+{
+    if (year)  *year  = 1980 + ((packed >> 9) & 0x7F);
+    if (month) *month = (packed >> 5) & 0x0F;
+    if (day)   *day   = packed & 0x1F;
+}
+
+static void data_unpack_clock_parts(packed, hour, minute, second)
+ushort packed;
+int *hour;
+int *minute;
+int *second;
+{
+    if (hour)   *hour   = (packed >> 11) & 0x1F;
+    if (minute) *minute = (packed >> 5) & 0x3F;
+    if (second) *second = (packed & 0x1F) * 2;
+}
+
+static int data_stricmp(a, b)
+char *a;
+char *b;
+{
+    int ca, cb;
+
+    if (!a) a = "";
+    if (!b) b = "";
+
+    while (*a || *b)
+    {
+        ca = toupper((unsigned char)*a);
+        cb = toupper((unsigned char)*b);
+
+        if (ca != cb)
+            return ca - cb;
+
+        if (*a) a++;
+        if (*b) b++;
+    }
+
+    return 0;
+}
+
+static int data_strnicmp(a, b, maxlen)
+char *a;
+char *b;
+int maxlen;
+{
+    int ca, cb;
+    int i;
+
+    if (!a) a = "";
+    if (!b) b = "";
+
+    for (i = 0; i < maxlen; i++)
+    {
+        ca = toupper((unsigned char)a[i]);
+        cb = toupper((unsigned char)b[i]);
+
+        if (ca != cb)
+            return ca - cb;
+
+        if (!a[i] || !b[i])
+            break;
+    }
+
+    return 0;
+}
+
 /* ------------------------------------------------------------ */
-/* config / paths                                               */
+/* paths/config                                                 */
 /* ------------------------------------------------------------ */
 
 int load_bbs_paths(fname)
@@ -176,14 +294,10 @@ char *fname;
 {
     FILE *fp;
     char line[256];
-    char key[64];
-    char val[192];
-    int i;
+    int sec;
 
     data_zero_paths();
-
-    for (i = 0; i < NUM_SECT; i++)
-        g_paths.updn_path[i][0] = 0;
+    data_set_default_paths();
 
     fp = fopen(fname, "rt");
     if (!fp)
@@ -191,52 +305,38 @@ char *fname;
 
     while (fgets(line, sizeof(line), fp))
     {
+        char *val;
+        char key[64];
+
         data_trim_crlf(line);
-        data_trim_all(line);
+        data_trim_spaces(line);
 
-        if (!line[0])
-            continue;
-        if (line[0] == ';')
+        if (!line[0] || line[0] == ';' || line[0] == '#')
             continue;
 
-        if (!data_parse_kv_line(line, key, val))
+        strcpy(key, line);
+        val = data_cfg_value(key);
+        if (!val)
             continue;
 
-        if (!stricmp(key, "MSG"))
-            strncpy(g_paths.msg_path, val, sizeof(g_paths.msg_path) - 1);
-        else if (!stricmp(key, "USR"))
-            strncpy(g_paths.usr_path, val, sizeof(g_paths.usr_path) - 1);
-        else if (!stricmp(key, "UD"))
-            strncpy(g_paths.ud_path, val, sizeof(g_paths.ud_path) - 1);
-        else if (!stricmp(key, "LOG"))
-            strncpy(g_paths.log_path, val, sizeof(g_paths.log_path) - 1);
-        else if (!strnicmp(key, "UPDN", 4))
+        if (!data_stricmp(key, "MSG_PATH"))
+            strncpy(g_paths.msg_path, val, MAX_PATHNAME - 1);
+        else if (!data_stricmp(key, "USR_PATH"))
+            strncpy(g_paths.usr_path, val, MAX_PATHNAME - 1);
+        else if (!data_stricmp(key, "UD_PATH"))
+            strncpy(g_paths.ud_path, val, MAX_PATHNAME - 1);
+        else if (!data_stricmp(key, "LOG_PATH"))
+            strncpy(g_paths.log_path, val, MAX_PATHNAME - 1);
+        else if (!data_strnicmp(key, "UPDN_PATH", 9))
         {
-            i = atoi(key + 4);
-            if (i >= 0 && i < NUM_SECT)
-                strncpy(g_paths.updn_path[i], val, sizeof(g_paths.updn_path[i]) - 1);
+            sec = atoi(key + 9);
+            if (sec >= 0 && sec < NUM_SECT)
+                strncpy(g_paths.updn_path[sec], val, MAX_PATHNAME - 1);
         }
     }
 
     fclose(fp);
-
-    data_fix_path_sep(g_paths.msg_path);
-    data_fix_path_sep(g_paths.usr_path);
-    data_fix_path_sep(g_paths.ud_path);
-    data_fix_path_sep(g_paths.log_path);
-
-    data_ensure_trailing_backslash(g_paths.msg_path);
-    data_ensure_trailing_backslash(g_paths.usr_path);
-    data_ensure_trailing_backslash(g_paths.ud_path);
-    data_ensure_trailing_backslash(g_paths.log_path);
-
-    for (i = 0; i < NUM_SECT; i++)
-    {
-        data_fix_path_sep(g_paths.updn_path[i]);
-        if (g_paths.updn_path[i][0])
-            data_ensure_trailing_backslash(g_paths.updn_path[i]);
-    }
-
+    data_set_default_paths();
     return 1;
 }
 
@@ -244,99 +344,95 @@ int load_cfginfo(fname)
 char *fname;
 {
     FILE *fp;
-    char line[256];
-    char key[64];
-    char val[192];
+    long len;
 
     data_zero_cfg();
 
     fp = fopen(fname, "rb");
-    if (fp)
+    if (!fp)
     {
-        size_t nread;
-
-        nread = fread(&g_cfg, 1, sizeof(g_cfg), fp);
-        fclose(fp);
-
-        if (nread == sizeof(g_cfg))
-            return 1;
+        (void)save_cfginfo(fname);
+        return 1;
     }
 
-    fp = fopen(fname, "rt");
-    if (!fp)
-        return 0;
+    fseek(fp, 0L, SEEK_END);
+    len = ftell(fp);
+    fseek(fp, 0L, SEEK_SET);
 
-    while (fgets(line, sizeof(line), fp))
+    if (len < (long)sizeof(CFGINFO))
     {
-        data_trim_crlf(line);
-        data_trim_all(line);
+        fclose(fp);
+        (void)save_cfginfo(fname);
+        return 1;
+    }
 
-        if (!line[0])
-            continue;
-        if (line[0] == ';')
-            continue;
-
-        if (!data_parse_kv_line(line, key, val))
-            continue;
-
-        if (!stricmp(key, "BBSNAME"))
-            strncpy(g_cfg.bbsname, val, sizeof(g_cfg.bbsname) - 1);
-        else if (!stricmp(key, "SYSOPNAME"))
-            strncpy(g_cfg.sysopname, val, sizeof(g_cfg.sysopname) - 1);
-        else if (!stricmp(key, "SYSPASS"))
-            strncpy(g_cfg.sysop_pass, val, sizeof(g_cfg.sysop_pass) - 1);
-        else if (!stricmp(key, "NODE"))
-            g_cfg.node = atoi(val);
-        else if (!stricmp(key, "MINBAUD"))
-            g_cfg.min_baud = atoi(val);
-        else if (!stricmp(key, "MAXBAUD"))
-            g_cfg.max_baud = atoi(val);
-        else if (!stricmp(key, "PAGELEN"))
-            g_cfg.page_len = atoi(val);
-        else if (!stricmp(key, "MAXNODES"))
-            g_cfg.max_nodes = atoi(val);
-        else if (!stricmp(key, "GUESTLIMIT"))
-            g_cfg.limit[0] = (ushort)atoi(val);
-        else if (!stricmp(key, "USERLIMIT"))
-            g_cfg.limit[1] = (ushort)atoi(val);
-        else if (!stricmp(key, "GUESTPRIV"))
-            g_cfg.priv[0] = (byte)atoi(val);
-        else if (!stricmp(key, "USERPRIV"))
-            g_cfg.priv[1] = (byte)atoi(val);
-        else if (!stricmp(key, "IDLELIMIT"))
-            g_cfg.idle_limit = (ushort)atoi(val);
+    if (fread(&g_cfg, sizeof(g_cfg), 1, fp) != 1)
+    {
+        fclose(fp);
+        data_zero_cfg();
+        return 0;
     }
 
     fclose(fp);
     return 1;
 }
 
-/* ------------------------------------------------------------ */
-/* data file open/close                                         */
-/* ------------------------------------------------------------ */
+int save_cfginfo(fname)
+char *fname;
+{
+    FILE *fp;
+
+    fp = fopen(fname, "wb");
+    if (!fp)
+        return 0;
+
+    if (fwrite(&g_cfg, sizeof(g_cfg), 1, fp) != 1)
+    {
+        fclose(fp);
+        return 0;
+    }
+
+    fclose(fp);
+    return 1;
+}
 
 int open_main_datafiles(void)
 {
     char path[MAX_PATHNAME * 2];
 
-    data_make_data_path(path, "USERDESC.DAT");
-    if (!data_open_one_file(&g_usrfp, path))
+    data_make_user_path(path, "USERDESC.DAT");
+    if (!data_ensure_header_file(path))
+        return 0;
+    g_usrfp = fopen(path, "r+b");
+    if (!g_usrfp)
         return 0;
 
     data_make_data_path(path, "MSGHEAD.DAT");
-    if (!data_open_one_file(&g_msgfp, path))
+    if (!data_ensure_header_file(path))
+        return 0;
+    g_msgfp = fopen(path, "r+b");
+    if (!g_msgfp)
         return 0;
 
     data_make_data_path(path, "MSGTEXT.DAT");
-    if (!data_open_one_file(&g_txtfp, path))
+    if (!data_ensure_header_file(path))
+        return 0;
+    g_txtfp = fopen(path, "r+b");
+    if (!g_txtfp)
         return 0;
 
-    data_make_data_path(path, "UDHEAD.DAT");
-    if (!data_open_one_file(&g_udfp, path))
+    data_make_ud_path(path, "UDHEAD.DAT");
+    if (!data_ensure_header_file(path))
+        return 0;
+    g_udfp = fopen(path, "r+b");
+    if (!g_udfp)
         return 0;
 
-    data_make_data_path(path, "CALLER.DAT");
-    if (!data_open_one_file(&g_logfp, path))
+    data_make_log_path(path, "CALLER.DAT");
+    if (!data_ensure_header_file(path))
+        return 0;
+    g_logfp = fopen(path, "r+b");
+    if (!g_logfp)
         return 0;
 
     return 1;
@@ -344,15 +440,15 @@ int open_main_datafiles(void)
 
 void close_main_datafiles(void)
 {
-    if (g_usrfp) { isam_close(g_usrfp); g_usrfp = NULL; }
-    if (g_msgfp) { isam_close(g_msgfp); g_msgfp = NULL; }
-    if (g_txtfp) { isam_close(g_txtfp); g_txtfp = NULL; }
-    if (g_udfp)  { isam_close(g_udfp);  g_udfp  = NULL; }
-    if (g_logfp) { isam_close(g_logfp); g_logfp = NULL; }
+    if (g_usrfp) { fclose(g_usrfp); g_usrfp = (FILE *)0; }
+    if (g_msgfp) { fclose(g_msgfp); g_msgfp = (FILE *)0; }
+    if (g_txtfp) { fclose(g_txtfp); g_txtfp = (FILE *)0; }
+    if (g_udfp)  { fclose(g_udfp);  g_udfp  = (FILE *)0; }
+    if (g_logfp) { fclose(g_logfp); g_logfp = (FILE *)0; }
 }
 
 /* ------------------------------------------------------------ */
-/* utility/string/date helpers                                  */
+/* text/date/time helpers                                       */
 /* ------------------------------------------------------------ */
 
 void data_trim_crlf(s)
@@ -363,9 +459,9 @@ char *s;
     if (!s)
         return;
 
-    p = strchr(s, '\r');
-    if (p) *p = 0;
     p = strchr(s, '\n');
+    if (p) *p = 0;
+    p = strchr(s, '\r');
     if (p) *p = 0;
 }
 
@@ -380,12 +476,16 @@ char *t;
     tmv = localtime(&now);
 
     if (d)
-        sprintf(d, "%04d-%02d-%02d",
-                tmv->tm_year + 1900, tmv->tm_mon + 1, tmv->tm_mday);
+        sprintf(d, "%02d/%02d/%04d",
+                tmv->tm_mday,
+                tmv->tm_mon + 1,
+                tmv->tm_year + 1900);
 
     if (t)
         sprintf(t, "%02d:%02d:%02d",
-                tmv->tm_hour, tmv->tm_min, tmv->tm_sec);
+                tmv->tm_hour,
+                tmv->tm_min,
+                tmv->tm_sec);
 }
 
 void data_prompt_line(prompt, buf, buflen)
@@ -396,76 +496,73 @@ int buflen;
     if (prompt)
         fputs(prompt, stdout);
 
-    if (!fgets(buf, buflen, stdin))
-    {
-        if (buflen > 0)
-            buf[0] = 0;
-        return;
-    }
-
-    data_trim_crlf(buf);
+    if (fgets(buf, buflen, stdin))
+        data_trim_crlf(buf);
+    else if (buflen > 0)
+        buf[0] = 0;
 }
 
 ushort data_pack_date_now(void)
 {
     time_t now;
     struct tm *tmv;
-    int year;
+    ushort y, m, d;
 
     now = time((time_t *)0);
     tmv = localtime(&now);
 
-    year = (tmv->tm_year + 1900) - 1980;
-    if (year < 0)
-        year = 0;
-    if (year > 127)
-        year = 127;
+    y = (ushort)((tmv->tm_year + 1900) - 1980);
+    m = (ushort)(tmv->tm_mon + 1);
+    d = (ushort)tmv->tm_mday;
 
-    return (ushort)((year << 9) | ((tmv->tm_mon + 1) << 5) | tmv->tm_mday);
+    return (ushort)((y << 9) | (m << 5) | d);
 }
 
 ushort data_pack_time_now(void)
 {
     time_t now;
     struct tm *tmv;
+    ushort h, m, s;
 
     now = time((time_t *)0);
     tmv = localtime(&now);
 
-    return (ushort)((tmv->tm_hour << 11) | (tmv->tm_min << 5) | (tmv->tm_sec / 2));
+    h = (ushort)tmv->tm_hour;
+    m = (ushort)tmv->tm_min;
+    s = (ushort)(tmv->tm_sec / 2);
+
+    return (ushort)((h << 11) | (m << 5) | s);
 }
 
 void data_unpack_date(p, out)
 ushort p;
 char *out;
 {
-    int year, mon, day;
+    int y, m, d;
 
-    year = 1980 + ((p >> 9) & 0x7F);
-    mon  = (p >> 5) & 0x0F;
-    day  = p & 0x1F;
-
-    sprintf(out, "%04d-%02d-%02d", year, mon, day);
+    data_unpack_date_time_parts(p, &y, &m, &d);
+    sprintf(out, "%02d/%02d/%04d", d, m, y);
 }
 
 void data_unpack_time(p, out)
 ushort p;
 char *out;
 {
-    int hour, min, sec;
+    int h, m, s;
 
-    hour = (p >> 11) & 0x1F;
-    min  = (p >> 5) & 0x3F;
-    sec  = (p & 0x1F) * 2;
-
-    sprintf(out, "%02d:%02d:%02d", hour, min, sec);
+    data_unpack_clock_parts(p, &h, &m, &s);
+    sprintf(out, "%02d:%02d:%02d", h, m, s);
 }
+
+/* ------------------------------------------------------------ */
+/* compares                                                     */
+/* ------------------------------------------------------------ */
 
 int data_user_match(a, b)
 char *a;
 char *b;
 {
-    return !stricmp(a ? a : "", b ? b : "");
+    return data_stricmp(a, b) == 0;
 }
 
 int data_name_match(a, b, maxlen)
@@ -473,18 +570,18 @@ char *a;
 char *b;
 int maxlen;
 {
-    return !strnicmp(a ? a : "", b ? b : "", maxlen);
+    return data_strnicmp(a, b, maxlen) == 0;
 }
 
 int data_cat_match(a, b)
 char *a;
 char *b;
 {
-    return !stricmp(a ? a : "", b ? b : "");
+    return data_stricmp(a, b) == 0;
 }
 
 /* ------------------------------------------------------------ */
-/* counters / finders / wrappers                                */
+/* counts                                                       */
 /* ------------------------------------------------------------ */
 
 long data_user_count(void)
@@ -514,8 +611,7 @@ long data_caller_count(void)
 
 long data_highest_msg_number(void)
 {
-    long i, n;
-    long high;
+    long i, n, high;
     MSGHEAD h;
 
     n = data_msg_count();
@@ -531,6 +627,10 @@ long data_highest_msg_number(void)
 
     return high;
 }
+
+/* ------------------------------------------------------------ */
+/* finders                                                      */
+/* ------------------------------------------------------------ */
 
 long data_find_user_by_name(name, u)
 char *name;
@@ -577,6 +677,10 @@ long data_find_blank_caller(void)
 {
     return isam_find_blank_caller();
 }
+
+/* ------------------------------------------------------------ */
+/* record read/write wrappers                                   */
+/* ------------------------------------------------------------ */
 
 int data_write_user(recno, u)
 long recno;
@@ -649,15 +753,16 @@ USRLOG *c;
 }
 
 /* ------------------------------------------------------------ */
-/* message text helpers                                         */
+/* message text chains                                          */
 /* ------------------------------------------------------------ */
 
 int data_store_message_text(body, firstptr)
 char *body;
 ushort *firstptr;
 {
-    long startrec;
-    long currec;
+    long start_rec;
+    long recno;
+    long newrec;
     MSGTEXT t;
     int len;
     int pos;
@@ -665,21 +770,15 @@ ushort *firstptr;
     if (!body || !firstptr)
         return 0;
 
-    startrec = data_find_blank_msgtext();
-    if (startrec < 0L)
-        startrec = data_msgtext_count();
+    start_rec = data_msgtext_count();
+    if (start_rec < 0L)
+        return 0;
 
-    *firstptr = (ushort)startrec;
+    *firstptr = (ushort)start_rec;
 
     len = strlen(body);
     pos = 0;
-    currec = startrec;
-
-    if (len == 0)
-    {
-        memset(&t, 0, sizeof(t));
-        return data_write_msgtext(currec, &t);
-    }
+    recno = start_rec;
 
     while (pos < len)
     {
@@ -693,27 +792,26 @@ ushort *firstptr;
         memcpy(t.text, body + pos, chunk);
         t.text[chunk] = 0;
 
-        if (currec >= data_msgtext_count())
-        {
-            if (isam_append_blank_record(g_txtfp, MSGTEXT_SIZE) < 0L)
-                return 0;
-        }
+        newrec = isam_append_blank_record(g_txtfp, MSGTEXT_SIZE);
+        if (newrec < 0L || newrec != recno)
+            return 0;
 
-        if (!data_write_msgtext(currec, &t))
+        if (!data_write_msgtext(recno, &t))
             return 0;
 
         pos += chunk;
-        currec++;
+        recno++;
     }
 
     memset(&t, 0, sizeof(t));
-    if (currec >= data_msgtext_count())
-    {
-        if (isam_append_blank_record(g_txtfp, MSGTEXT_SIZE) < 0L)
-            return 0;
-    }
+    newrec = isam_append_blank_record(g_txtfp, MSGTEXT_SIZE);
+    if (newrec < 0L || newrec != recno)
+        return 0;
 
-    return data_write_msgtext(currec, &t);
+    if (!data_write_msgtext(recno, &t))
+        return 0;
+
+    return 1;
 }
 
 int data_load_message_text(firstptr, out, outlen)
@@ -722,7 +820,6 @@ char *out;
 int outlen;
 {
     long recno;
-    long ntext;
     int used;
     MSGTEXT t;
 
@@ -734,23 +831,27 @@ int outlen;
     if (firstptr == 0)
         return 1;
 
-    ntext = data_msgtext_count();
     recno = (long)firstptr;
     used = 0;
 
-    while (recno < ntext)
+    while (data_read_msgtext(recno, &t))
     {
-        if (!data_read_msgtext(recno, &t))
-            return 0;
+        int chunk;
 
         if (!t.text[0])
             break;
 
-        if ((used + strlen(t.text)) >= (unsigned)(outlen - 1))
+        chunk = strlen(t.text);
+        if ((used + chunk + 1) >= outlen)
+            chunk = outlen - used - 1;
+
+        if (chunk <= 0)
             break;
 
-        strcat(out, t.text);
-        used += strlen(t.text);
+        memcpy(out + used, t.text, chunk);
+        used += chunk;
+        out[used] = 0;
+
         recno++;
     }
 
@@ -761,48 +862,37 @@ void data_zero_message_chain(firstptr)
 ushort firstptr;
 {
     long recno;
-    long ntext;
     MSGTEXT t;
+    int was_empty;
 
     if (firstptr == 0)
         return;
 
-    ntext = data_msgtext_count();
     recno = (long)firstptr;
 
-    while (recno < ntext)
+    while (data_read_msgtext(recno, &t))
     {
-        if (!data_read_msgtext(recno, &t))
-            break;
-
-        if (!t.text[0])
-            break;
+        was_empty = (t.text[0] == 0);
 
         memset(&t, 0, sizeof(t));
         (void)data_write_msgtext(recno, &t);
+
+        if (was_empty)
+            break;
+
         recno++;
     }
-
-    memset(&t, 0, sizeof(t));
-    if (recno < ntext)
-        (void)data_write_msgtext(recno, &t);
 }
 
 /* ------------------------------------------------------------ */
-/* path / file helpers                                          */
+/* path/disk helpers                                            */
 /* ------------------------------------------------------------ */
 
 void data_make_data_path(out, name)
 char *out;
 char *name;
 {
-    if (!out)
-        return;
-
-    if (!name)
-        name = "";
-
-    sprintf(out, "%s%s", g_paths.msg_path, name);
+    data_join_path(out, g_paths.msg_path, name);
 }
 
 void data_make_updn_path(out, section, name)
@@ -810,17 +900,10 @@ char *out;
 int section;
 char *name;
 {
-    char *base;
+    if (section < 0 || section >= NUM_SECT)
+        section = 0;
 
-    if (!out)
-        return;
-
-    if (section >= 0 && section < NUM_SECT && g_paths.updn_path[section][0])
-        base = g_paths.updn_path[section];
-    else
-        base = g_paths.ud_path;
-
-    sprintf(out, "%s%s", base, name ? name : "");
+    data_join_path(out, g_paths.updn_path[section], name);
 }
 
 int data_disk_file_exists(path)

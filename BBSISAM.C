@@ -1,6 +1,6 @@
 /* BBSISAM.C
  *
- * BBS-PC ! 4.21
+ * BBS-PC! 4.21
  *
  * Fixed-record ISAM-style access helpers.
  *
@@ -49,6 +49,7 @@ USERREC *src;
     dst->dn_acc      = src->dn_acc;
     dst->sys_acc     = src->sys_acc;
     dst->sect_mask   = src->sect_mask;
+    dst->bull_mask   = src->bull_mask;
 
     dst->time_limit  = src->time_limit;
     dst->menu_set    = src->menu_set;
@@ -87,6 +88,7 @@ USRDESC *src;
     dst->dn_acc      = src->dn_acc;
     dst->sys_acc     = src->sys_acc;
     dst->sect_mask   = src->sect_mask;
+    dst->bull_mask   = src->bull_mask;
 
     dst->time_limit  = src->time_limit;
     dst->menu_set    = src->menu_set;

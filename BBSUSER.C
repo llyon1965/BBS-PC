@@ -1,6 +1,6 @@
 /* BBSUSER.C
  *
- * BBS-PC ! 4.21
+ * BBS-PC! 4.21
  *
  * Reconstructed and modernised source
  * derived from BBS-PC 4.20
@@ -84,6 +84,7 @@ USRDESC *u;
     u->dn_acc = 0;
     u->sys_acc = 0;
     u->sect_mask = 0;
+    u->bull_mask = 0;
 
     for (i = 0; i < NUM_SECT; i++)
     {
@@ -227,6 +228,7 @@ USRDESC *u;
     printf("Protocol  : %u\n", (unsigned)u->protocol);
     printf("Expert    : %s\n", u->expert ? "Yes" : "No");
     printf("Ratio     : %u\n", (unsigned)u->dnldratio);
+    printf("Bull mask : %04X\n", (unsigned)u->bull_mask);
 }
 
 static int user_prompt_edit_numeric(prompt, current)
@@ -287,6 +289,10 @@ USRDESC *u;
     u->expert =
         (byte)user_prompt_edit_numeric("Expert 0/1 (blank = keep): ",
                                        (int)u->expert);
+
+    u->bull_mask =
+        (bits)user_prompt_edit_numeric("Bulletin mask (blank = keep): ",
+                                       (int)u->bull_mask);
 
     user_apply_runtime_sanity(u);
 }
@@ -368,6 +374,7 @@ void do_add_user(void)
     u.uploads = 0;
     u.downloads = 0;
     u.highmsgread = 0L;
+    u.bull_mask = 0;
 
     recno = data_find_blank_user();
     if (recno < 0L)
@@ -550,4 +557,37 @@ void do_user_statistics(void)
     printf("Total records : %ld\n", n);
     printf("Active users  : %ld\n", active);
     printf("Locked users  : %ld\n", locked);
+}
+
+void do_expert_toggle(void)
+{
+    g_sess.user.expert = g_sess.user.expert ? 0 : 1;
+    g_sess.expert = g_sess.user.expert ? 1 : 0;
+    (void)user_save_current();
+    printf("Expert mode %s\n", g_sess.user.expert ? "ON" : "OFF");
+}
+
+void do_reset_bulletin_flags(void)
+{
+    long i, n;
+    USRDESC u;
+
+    if (!sysop_password_prompt())
+        return;
+
+    n = data_user_count();
+
+    for (i = 0L; i < n; i++)
+    {
+        if (!data_read_user(i, &u))
+            continue;
+
+        if (!u.name[0])
+            continue;
+
+        u.bull_mask = 0;
+        (void)data_write_user(i, &u);
+    }
+
+    puts("Bulletin flags reset");
 }

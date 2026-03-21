@@ -1,25 +1,22 @@
 /* BBSMENU.C
  *
- * BBS-PC ! 4.21
+ * BBS-PC! 4.21
  *
  * Tightened compiled .MEN loader/executor
  *
  * Supports:
- * - real compiled BBS-PC .MEN binary files
+ * - compiled .MEN binary files
  * - fallback interim text format
  * - IRET records
  * - chained menu commands
  * - stack-based menu navigation
  *
  * Tightened:
- * - privilege checks use seclevel
- * - access_mode / section_mask enforced correctly
- * - access_mode 7 prompts for sysop password only at execution time
- * - execution is blocked even if a hidden key is typed directly
- * - return/goto helpers are explicitly stack-based
- * - GOTO MENU truly replaces the current menu, including from MAIN
- * - RETURN TOP unwinds to the base menu
- * - popped/replaced menu frames are cleared so nested menus do not leak state
+ * - access control enforced correctly
+ * - access_mode 7 prompts only at execution time
+ * - return levels/top behave correctly
+ * - nested menus do not leak stack/state
+ * - opcode 35 explicitly dispatches to do_node_editor()
  */
 
 #include <stdio.h>
@@ -612,17 +609,6 @@ static void menu_return_top_level_stack(void)
     node_mark_menu(g_sess.mstack.menu[0].filename);
 }
 
-void do_return_specified_levels(void)
-{
-    if (!menu_pop())
-        return;
-}
-
-void do_return_top_level(void)
-{
-    menu_return_top_level_stack();
-}
-
 /* ------------------------------------------------------------ */
 /* display/access helpers                                       */
 /* ------------------------------------------------------------ */
@@ -909,7 +895,7 @@ int idx;
             break;
 
         case MF_RET_TOP:
-            do_return_top_level();
+            menu_return_top_level_stack();
             break;
 
         case MF_CALL_MENU:
@@ -1111,7 +1097,7 @@ int idx;
             break;
 
         case MF_NODE_DEF:
-            do_change_node_defaults();
+            do_node_editor();
             break;
 
         case MF_LIST_PHONE:
