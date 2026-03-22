@@ -49,6 +49,7 @@ typedef unsigned short bits;
 #define NAME_LEN            35
 #define PWD_LEN             15
 #define CITY_LEN            24
+#define PHONE_LEN           20
 #define SUBJ_LEN            72
 #define CAT_LEN             40
 #define TEXT_LEN            128
@@ -100,23 +101,28 @@ typedef struct {
     int  page_len;
     int  max_nodes;
 
-    /* NEW: modem defaults */
     int  modem_baud;
     int  modem_parity;      /* 'N','E','O' */
     int  modem_data_bits;   /* 7/8 */
     int  modem_stop_bits;   /* 1/2 */
 
-    ushort limit[2];
-    byte   priv[2];
     ushort idle_limit;
 
     char sect_name[NUM_SECT][SECT_NAME_LEN + 1];
     char term_name[NUM_TERM_TYPES][TERM_NAME_LEN + 1];
 
-    bits rd_acc[NUM_SECT];
-    bits wr_acc[NUM_SECT];
-    bits up_acc[NUM_SECT];
-    bits dn_acc[NUM_SECT];
+    /* guest/member defaults */
+    ushort limit[2];
+    byte   priv[2];
+    byte   dnldratio[2];
+    byte   menu_set[2];
+    byte   protocol[2];
+
+    bits   rd_acc[2];
+    bits   wr_acc[2];
+    bits   up_acc[2];
+    bits   dn_acc[2];
+    bits   sys_acc[2];
 } CFGINFO;
 
 /* ------------------------------------------------------------ */
@@ -151,11 +157,14 @@ typedef struct {
     char   name[NAME_LEN + 1];
     char   pwd[PWD_LEN + 1];
     char   city[CITY_LEN + 1];
+    char   phone[PHONE_LEN + 1];
+    char   phone[PHONE_LEN + 1];
 
     ushort lastdate;
     ushort lasttime;
 
     ushort calls;
+    ushort messages;      /* lifetime messages written */
     ushort uploads;
     ushort downloads;
 
@@ -171,6 +180,13 @@ typedef struct {
 
     ushort time_limit;
     byte   menu_set;
+    byte   term;
+    byte   cls[4];
+    byte   bs[3];
+    ushort page_width;
+    ushort page_len;
+    byte   linefeeds;
+    byte   nuls;
 
     byte   protocol;
     byte   expert;
@@ -251,6 +267,7 @@ typedef struct {
     ushort lasttime;
 
     ushort calls;
+    ushort messages;      /* lifetime messages written */
     ushort uploads;
     ushort downloads;
 
@@ -266,12 +283,40 @@ typedef struct {
 
     ushort time_limit;
     byte   menu_set;
+    byte   term;
+    byte   cls[4];
+    byte   bs[3];
+    ushort page_width;
+    ushort page_len;
+    byte   linefeeds;
+    byte   nuls;
 
     byte   protocol;
     byte   expert;
     byte   seclevel;
     byte   dnldratio;
 } USRDESC;
+
+typedef struct {
+    long   number;
+    long   replyto;
+    long   replys[MAX_REPLY_LINKS];
+
+    ushort msgptr;
+    ushort date;
+    ushort time;
+
+    byte   section;
+
+    char   from[NAME_LEN + 1];
+    char   to[NAME_LEN + 1];
+    char   subject[SUBJ_LEN + 1];
+} MSGHEAD;
+
+typedef struct {
+    char cat_name[CAT_LEN + 1];
+    byte section;
+} UDHEAD;
 
 typedef struct {
     int status;
@@ -287,24 +332,34 @@ typedef struct {
 typedef struct {
     USRDESC user;
 
-    int running;
-    int node;
-    int local_login;
-    int logged_in;
-    int expert;
+    int  running;
+    int  node;
+    int  local_login;
+    int  logged_in;
+    int  menu_set;
+    int  expert;
+
+    int  page_sysop;
+    int  msgs_left;
+    int  uploads;
 
     ulong logon_unix;
     ulong last_activity_unix;
 
-    int base_minutes_allowed;
-    int bonus_minutes;
-    int ratio_off;
-    int last_time_warning;
+    ushort prev_lastdate;
+    ushort prev_lasttime;
 
-    long caller_log_recno;
+    int   base_minutes_allowed;
+    int   bonus_minutes;
+    int   ratio_off;
+    int   last_time_warning;
+
+    long  caller_log_recno;
     ulong caller_no;
+    ushort start_uploads;
+    ushort start_downloads;
 
-    char disconnect_reason[DISC_REASON_LEN + 1];
+    char  disconnect_reason[DISC_REASON_LEN + 1];
 
     MENUSTACK mstack;
 } BBSSESSION;

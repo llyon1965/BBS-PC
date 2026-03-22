@@ -299,6 +299,7 @@ void do_return_top_level(void);
 /* ------------------------------------------------------------ */
 
 void do_leave_message(void);
+void do_leave_message_in_section(int sec);
 void do_leave_message_to_sysop(void);
 void do_leave_message_to_name(void);
 void do_read_messages(void);
@@ -342,13 +343,13 @@ void do_print_user_list(void);
 void do_update_user_defaults(void);
 void do_user_edit(void);
 void do_user_statistics(void);
-
-/* ------------------------------------------------------------ */
-/* maintenance/default editors                                  */
-/* ------------------------------------------------------------ */
-
 void do_expert_toggle(void);
 void do_reset_bulletin_flags(void);
+
+/* ------------------------------------------------------------ */
+/* configuration editors                                        */
+/* ------------------------------------------------------------ */
+
 void do_define_section_names(void);
 void do_define_terminal_types(void);
 void do_modem_defaults(void);
@@ -375,7 +376,7 @@ void term_getline_hidden(char *prompt, char *buf, int buflen);
 int term_yesno(char *prompt, int def_yes);
 
 /* ------------------------------------------------------------ */
-/* fossil / modem                                               */
+/* fossil / modem / live protocol layer                         */
 /* ------------------------------------------------------------ */
 
 int fossil_driver_installed(void);
@@ -388,8 +389,20 @@ int modem_send_byte(int ch);
 int modem_recv_byte(int timeout);
 void modem_direct_upload(void);
 
+/*
+ * Public transfer entry points.
+ * NOTE:
+ * These are currently implemented in BBSMODM.C.
+ */
 int proto_upload(char *path, int proto);
 int proto_download(char *path, int proto);
+
+/* ------------------------------------------------------------ */
+/* external execution                                           */
+/* ------------------------------------------------------------ */
+
+int xtrn_run_command(char *cmd);
+int xtrn_drop_to_dos(void);
 
 /* ------------------------------------------------------------ */
 /* main bbs                                                     */
