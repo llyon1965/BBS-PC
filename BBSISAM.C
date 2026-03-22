@@ -36,9 +36,13 @@ USERREC *src;
     strncpy(dst->city, src->city, CITY_LEN);
     dst->city[CITY_LEN] = 0;
 
+    strncpy(dst->phone, src->phone, PHONE_LEN);
+    dst->phone[PHONE_LEN] = 0;
+
     dst->lastdate    = src->lastdate;
     dst->lasttime    = src->lasttime;
     dst->calls       = src->calls;
+    dst->messages    = src->messages;
     dst->uploads     = src->uploads;
     dst->downloads   = src->downloads;
     dst->highmsgread = src->highmsgread;
@@ -53,6 +57,13 @@ USERREC *src;
 
     dst->time_limit  = src->time_limit;
     dst->menu_set    = src->menu_set;
+    dst->term        = src->term;
+    memcpy(dst->cls, src->cls, sizeof(dst->cls));
+    memcpy(dst->bs, src->bs, sizeof(dst->bs));
+    dst->page_width  = src->page_width;
+    dst->page_len    = src->page_len;
+    dst->linefeeds   = src->linefeeds;
+    dst->nuls        = src->nuls;
 
     dst->protocol    = src->protocol;
     dst->expert      = src->expert;
@@ -75,9 +86,13 @@ USRDESC *src;
     strncpy(dst->city, src->city, DISK_CITY_LEN);
     dst->city[DISK_CITY_LEN] = 0;
 
+    strncpy(dst->phone, src->phone, PHONE_LEN);
+    dst->phone[PHONE_LEN] = 0;
+
     dst->lastdate    = src->lastdate;
     dst->lasttime    = src->lasttime;
     dst->calls       = src->calls;
+    dst->messages    = src->messages;
     dst->uploads     = src->uploads;
     dst->downloads   = src->downloads;
     dst->highmsgread = src->highmsgread;
@@ -92,6 +107,13 @@ USRDESC *src;
 
     dst->time_limit  = src->time_limit;
     dst->menu_set    = src->menu_set;
+    dst->term        = src->term;
+    memcpy(dst->cls, src->cls, sizeof(dst->cls));
+    memcpy(dst->bs, src->bs, sizeof(dst->bs));
+    dst->page_width  = src->page_width;
+    dst->page_len    = src->page_len;
+    dst->linefeeds   = src->linefeeds;
+    dst->nuls        = src->nuls;
 
     dst->protocol    = src->protocol;
     dst->expert      = src->expert;

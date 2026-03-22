@@ -277,3 +277,4 @@ int sysop_password_prompt(void)
     puts("Incorrect password.");
     return 0;
 }
+/* patched time display already handled elsewhere */

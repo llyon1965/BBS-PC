@@ -166,13 +166,36 @@ char *parm;
         return;
     }
 
-    printf("Executing external program: %s\n", parm);
-    system(parm);
+    puts("");
+    printf("Executing: %s
+", parm);
+    puts("");
+
+    if (!xtrn_run_command(parm))
+    {
+        puts("Execution failed");
+        return;
+    }
+
+    puts("");
+    puts("Program complete");
+    puts("");
 }
 
 void do_dos_gate(void)
 {
-    puts("DOS gate not yet expanded");
+    if (!sysop_password_prompt())
+        return;
+
+    puts("");
+    puts("Entering DOS...");
+    puts("");
+
+    (void)xtrn_drop_to_dos();
+
+    puts("");
+    puts("Returned from DOS");
+    puts("");
 }
 
 void do_section_names(void)

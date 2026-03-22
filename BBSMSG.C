@@ -774,6 +774,14 @@ void do_leave_message(void)
         return;
     }
 
+    g_sess.user.messages++;
+    g_sess.msgs_left++;
+    (void)user_save_current();
+
+    g_sess.user.messages++;
+    g_sess.msgs_left++;
+    (void)user_save_current();
+
     puts("Message saved");
 }
 
@@ -824,6 +832,10 @@ void do_leave_message_to_sysop(void)
         puts("Unable to save message");
         return;
     }
+
+    g_sess.user.messages++;
+    g_sess.msgs_left++;
+    (void)user_save_current();
 
     puts("Message left for SYSOP");
 }
